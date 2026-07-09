@@ -274,10 +274,10 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            cleanup_for_exit(app);
-        }
+    app.run(|app, event| match event {
+        tauri::RunEvent::Reopen { .. } => show_main_window(app),
+        tauri::RunEvent::ExitRequested { .. } => cleanup_for_exit(app),
+        _ => {}
     });
 }
 
