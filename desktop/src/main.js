@@ -106,6 +106,8 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({ url: "http://127.0.0.1:8990", msg: "（预览模式：假装已就绪）", action: "started" });
     case "status":
       return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
+    case "boot_error":
+      return Promise.resolve(null);
     case "app_version":
       return Promise.resolve("0.0.0-preview");
     case "run_doctor":
@@ -1148,6 +1150,16 @@ function wire() {
 window.addEventListener("DOMContentLoaded", async () => {
   wire();
   await loadConfig();
+  if (!PREVIEW && window.__TAURI__.event) {
+    window.__TAURI__.event.listen("boot://failed", (e) => {
+      setMsg("自动启动未成功：" + (e.payload || "未知原因") + "\n可检查配置后点「一键开始」重试。", "err");
+      refreshStatus();
+    });
+  }
+  try {
+    const bootError = await call("boot_error");
+    if (bootError) setMsg("自动启动未成功：" + bootError + "\n可检查配置后点「一键开始」重试。", "err");
+  } catch (e) {}
   try { els.verLabel.textContent = "v" + (await call("app_version")); } catch (e) {}
   await refreshStatus();
   if (PREVIEW) {
