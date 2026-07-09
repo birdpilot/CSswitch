@@ -35,7 +35,10 @@ enum LaunchPath {
     BootScience,
 }
 
-fn decide_launch(cfg: &config::Config) -> LaunchPath {
+fn decide_launch_with_auto_boot(cfg: &config::Config, auto_boot: bool) -> LaunchPath {
+    if !auto_boot {
+        return LaunchPath::ShowPanel;
+    }
     if cfg.mode == "official" {
         return LaunchPath::OpenOfficial;
     }
@@ -43,6 +46,14 @@ fn decide_launch(cfg: &config::Config) -> LaunchPath {
         Some(p) if !p.api_key.trim().is_empty() => LaunchPath::BootScience,
         _ => LaunchPath::ShowPanel,
     }
+}
+
+fn decide_launch(cfg: &config::Config) -> LaunchPath {
+    let auto_boot = std::env::var("CSSWITCH_AUTO_BOOT_ON_LAUNCH")
+        .ok()
+        .as_deref()
+        == Some("1");
+    decide_launch_with_auto_boot(cfg, auto_boot)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -274,7 +285,7 @@ pub fn run() {
 mod tests {
     use crate::config::{Config, Profile};
     use crate::runtime::system::redact;
-    use crate::{decide_launch, should_begin_boot, AppState, BootState, LaunchPath};
+    use crate::{decide_launch_with_auto_boot, should_begin_boot, AppState, BootState, LaunchPath};
 
     #[test]
     fn app_state_clear_proxy_identity_removes_runtime_credentials() {
@@ -313,40 +324,68 @@ mod tests {
     }
 
     #[test]
-    fn decide_launch_uses_current_mode_and_active_profile_key() {
+    fn decide_launch_defaults_to_showing_panel() {
+        let active_with_key = Config {
+            profiles: vec![keyed_profile("p1", "sk-present")],
+            active_id: "p1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&active_with_key, false),
+            LaunchPath::ShowPanel
+        );
+    }
+
+    #[test]
+    fn decide_launch_auto_boot_uses_current_mode_and_active_profile_key() {
         let official = Config {
             mode: "official".into(),
             ..Default::default()
         };
-        assert_eq!(decide_launch(&official), LaunchPath::OpenOfficial);
+        assert_eq!(
+            decide_launch_with_auto_boot(&official, true),
+            LaunchPath::OpenOfficial
+        );
 
         let no_active = Config {
             profiles: vec![keyed_profile("p1", "sk-present")],
             active_id: String::new(),
             ..Default::default()
         };
-        assert_eq!(decide_launch(&no_active), LaunchPath::ShowPanel);
+        assert_eq!(
+            decide_launch_with_auto_boot(&no_active, true),
+            LaunchPath::ShowPanel
+        );
 
         let active_without_key = Config {
             profiles: vec![keyed_profile("p1", "")],
             active_id: "p1".into(),
             ..Default::default()
         };
-        assert_eq!(decide_launch(&active_without_key), LaunchPath::ShowPanel);
+        assert_eq!(
+            decide_launch_with_auto_boot(&active_without_key, true),
+            LaunchPath::ShowPanel
+        );
 
         let active_with_key = Config {
             profiles: vec![keyed_profile("p1", "sk-present")],
             active_id: "p1".into(),
             ..Default::default()
         };
-        assert_eq!(decide_launch(&active_with_key), LaunchPath::BootScience);
+        assert_eq!(
+            decide_launch_with_auto_boot(&active_with_key, true),
+            LaunchPath::BootScience
+        );
 
         let dangling_active = Config {
             profiles: vec![keyed_profile("p1", "sk-present")],
             active_id: "missing".into(),
             ..Default::default()
         };
-        assert_eq!(decide_launch(&dangling_active), LaunchPath::ShowPanel);
+        assert_eq!(
+            decide_launch_with_auto_boot(&dangling_active, true),
+            LaunchPath::ShowPanel
+        );
     }
 
     #[test]
