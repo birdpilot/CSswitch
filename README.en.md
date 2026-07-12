@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.3"><img src="https://img.shields.io/badge/release-v0.4.3-2ea44f.svg" alt="CSSwitch v0.4.3"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.4"><img src="https://img.shields.io/badge/release-v0.4.4-2ea44f.svg" alt="CSSwitch v0.4.4"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,7 +24,7 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 [Download latest release](../../releases/latest) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.3 upgrade note:** A Science agent can create `<name>.skill.md` in the current workspace root. On the next one-click start, CSSwitch takes it over, persists and deploys it, then automatically restarts isolated Science. Store conflicts are quarantined without deletion and valid Skills are restored when possible. See [Upgrade and rollback](./docs/upgrade-and-rollback.md).
+> **0.4.4:** One-click startup no longer scans external Skills, reads legacy store/inventory, or reconciles deployments. Upgrades keep using `~/.csswitch/sandbox/home/.claude-science` without migrating, deleting, or overwriting existing Science data. See the [architecture contract](./docs/ARCHITECTURE.md).
 
 ## Contents
 
@@ -70,7 +70,7 @@ Claude Science sandbox
 - Click "一键开始" (Start) to launch the proxy, prepare the sandbox, and open Science.
 - Show the actual selected model name in Science instead of a vague `claude` or `opus` label.
 - Switch back to "Official Claude" without interfering with your real Claude login.
-- Scan, import, inventory, and deploy local research Skills; managed copies are independent of their source and can be restored after sandbox reconstruction.
+- Reuse Science's persistent data-dir; Skill state is no longer a CSSwitch startup gate. In third-party mode, native Science Skill import/publish paths that depend on the Anthropic account catalog may be unavailable.
 
 **For advanced users**
 
@@ -102,7 +102,7 @@ To use Science with its official service configuration, switch to "官方 Claude
 
 ## Upgrading from an older version
 
-CSSwitch 0.4.3 keeps the existing v2 configuration format. Quit the older app, drag 0.4.3 into Applications, and replace the existing copy. Back up all of `~/.csswitch/` first because it includes configuration and imported Skills. Rolling back replaces only the app and does not remove new data; older releases ignore Skill Manager data they do not understand.
+Version 0.4.4 keeps the existing v2 configuration format and reuses `~/.csswitch/sandbox/home/.claude-science`, so existing Science organizations, projects, and Skills are not migrated or overwritten when Skill Manager is removed. Legacy CSSwitch Skill store/inventory files remain untouched but no longer participate in startup; external `~/.claude/skills` trees are no longer synchronized into Science.
 
 For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 

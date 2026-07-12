@@ -57,5 +57,11 @@ test/test_make_virtual_oauth.mjs
 docs/*
 !docs/assets/
 !docs/assets/**
+!docs/ARCHITECTURE.md
+!docs/SCIENCE_RUNTIME.md
+!docs/DEVELOPMENT.md
+!docs/RELEASE.md
+!docs/references/
+!docs/references/**
 !docs/upgrade-and-rollback.md
 !docs/release-evidence-v0.4.2.md

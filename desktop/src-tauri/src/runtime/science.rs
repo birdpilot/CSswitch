@@ -17,7 +17,7 @@ pub(crate) fn sandbox_home() -> PathBuf {
     config::default_dir().join("sandbox").join("home")
 }
 
-/// CSSwitch 隔离 Science 的 data-dir；Skill 运行副本只能落在其 `skills/` 子目录。
+/// CSSwitch 隔离 Science 的持久化 data-dir；其中的 Skill 内容由 Science 自身管理。
 pub(crate) fn sandbox_data_dir() -> PathBuf {
     sandbox_home().join(".claude-science")
 }
@@ -91,35 +91,6 @@ fn science_bin_for_paths(
 fn science_bin_for(data_dir: &Path) -> Option<PathBuf> {
     let explicit_bin = std::env::var_os("SCIENCE_BIN").map(PathBuf::from);
     science_bin_for_paths(data_dir, explicit_bin.as_deref(), Path::new(SCIENCE_BIN))
-}
-
-pub(crate) fn sandbox_science_version() -> Option<String> {
-    let home = sandbox_home();
-    let data_dir = sandbox_data_dir();
-    let bin = science_bin_for(&data_dir)?;
-    let out = Command::new(bin)
-        .arg("--version")
-        .env("HOME", home)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let line = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    if line.is_empty()
-        || line.len() > 160
-        || !line.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(byte, b'.' | b'-' | b'_' | b' ' | b'(' | b')' | b',')
-        })
-    {
-        return None;
-    }
-    Some(line)
 }
 
 #[cfg(test)]

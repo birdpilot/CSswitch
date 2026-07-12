@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.4] — 2026-07-12
+
+### Changed
+
+- Removed Skill Manager from the compiled application, Tauri command registry, and one-click startup path. Science remains the owner of its persistent data-dir and native Skill lifecycle.
+- One-click startup no longer scans external or workspace Skills, reads or recovers the legacy store/inventory, reconciles deployments, stops Science for Skill changes, or requires a reconcile marker.
+
+### Compatibility
+
+- Continue to reuse `~/.csswitch/sandbox/home/.claude-science`; existing Science organization, project, and Skill data is left untouched.
+- Keep legacy CSSwitch Skill store/inventory files in place but unused. Large or unreadable external Skill trees, `STORE_CONFLICT`, broken inventory, and missing Skill catalog data cannot block startup.
+- Science's supported external-Skill authoring and GitHub-import paths may require a valid Anthropic account catalog. Version 0.4.4 does not bypass OAuth, emulate that catalog, or claim that natural-language external-Skill installation works in third-party mode.
+
 ## [0.4.3] — 2026-07-12
 
 ### Fixed

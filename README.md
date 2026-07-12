@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.3"><img src="https://img.shields.io/badge/release-v0.4.3-2ea44f.svg" alt="CSSwitch v0.4.3"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.4"><img src="https://img.shields.io/badge/release-v0.4.4-2ea44f.svg" alt="CSSwitch v0.4.4"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,7 +24,7 @@ CSSwitch 是一个给 Claude Science 使用的本地配置转换器。它把 Sci
 
 [下载最新版](../../releases/latest) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.3 升级提示：** Science agent 可在当前 workspace 根目录生成 `<名称>.skill.md`；再次点击一键开始后，CSSwitch 会自动接管、持久化、部署并重启隔离 Science。Skill store 冲突会无损隔离并尝试恢复有效 Skill。见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
+> **0.4.4：** CSSwitch 一键启动不再扫描外部 Skill、读取旧 store/inventory 或执行 reconcile。升级继续复用 `~/.csswitch/sandbox/home/.claude-science`，不迁移、删除或覆盖现有 Science 数据。现行边界见 [架构说明](./docs/ARCHITECTURE.md)。
 
 ## 目录
 
@@ -70,7 +70,7 @@ Claude Science sandbox
 - 点击「一键开始」会自动启动代理、准备隔离环境、打开 Science。
 - Science 顶部模型选择器会显示你选择的真实模型名，而不是笼统的 `claude` 或 `opus`。
 - 可以一键切回「官方 Claude」模式，不干扰你的真实 Claude 登录。
-- 扫描、导入、管理并部署本地科研 Skill；导入副本与来源解耦，沙箱重建后可从 store 恢复。
+- 复用 Science 的持久化 data-dir；Skill 状态不再阻塞 CSSwitch 启动。第三方模式下，依赖 Anthropic 账号 catalog 的 Science 原生 Skill 导入/发布入口可能不可用。
 
 **给进阶用户**
 
@@ -102,7 +102,7 @@ Claude Science sandbox
 
 ## 从旧版升级
 
-0.4.3 保留现有 v2 配置格式。退出旧版 CSSwitch 后，将 0.4.3 拖入「应用程序」并覆盖即可；首次启动仍可能需要右键选择「打开」。升级前建议备份整个 `~/.csswitch/`，其中包含配置和已导入 Skill。回滚只替换 app，不会自动删除新数据；旧版本会忽略它无法识别的 Skill Manager 数据。
+0.4.4 保留现有 v2 配置格式并继续复用 `~/.csswitch/sandbox/home/.claude-science`，因此已有 Science 组织、项目和 Skill 不会因解除 Skill Manager 而被迁移或覆盖。旧 `~/.csswitch/` Skill store/inventory 会原样保留但不再参与启动；外部 `~/.claude/skills` 也不再自动同步到 Science。
 
 完整步骤、备份位置和回滚边界见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
 
@@ -148,6 +148,7 @@ CSSwitch 不是 Claude 官方服务，第三方模型模式也不会获得 Anthr
 
 - Anthropic 托管的远程 MCP 服务不可用，例如 `pubmed`、`clinical-trials`、`chembl`、`biorxiv` 等 `*.mcp.claude.com` 服务。
 - 依赖真实 Claude 账号授权的目录连接器、远程插件、云端能力可能会显示 session expired、unavailable 或 skipped。
+- Science 当前的外部 Skill GitHub 导入和新 Skill 发布会查询 Anthropic 账号 catalog；第三方模型模式没有真实 Anthropic 登录时可能失败。CSSwitch 0.4.4 不伪造 OAuth 或 catalog，也尚未提供自然语言本地安装桥。
 - 第三方模型对工具调用、长上下文、thinking、图片和流式输出的兼容程度不同；原生 Anthropic 端点通常比 OpenAI 翻译路径更稳。
 - 当前 macOS 包尚未 Apple 公证，首次启动需要手动放行。
 - inference gateway 已是随应用打包的 Rust sidecar；不再提供运行时 Python fallback。
