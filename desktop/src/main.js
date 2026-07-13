@@ -35,6 +35,7 @@ const mockStore = {
   active_id: "",
   proxy_port: 18991,
   sandbox_port: 8990,
+  reuse_system_ssh: false,
   mode: "proxy",
   profiles: [
     { id: "p-demo1", name: "我的 GLM", template_id: "glm", category: "cn_official", api_format: "anthropic", base_url: "https://open.bigmodel.cn/api/anthropic", model: "glm-4.6", key: "••••••1234", icon: "glm", icon_color: "#2E6BE6", website_url: "https://open.bigmodel.cn", sort_index: 1, notes: "" },
@@ -48,6 +49,7 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({
         schema_version: mockStore.schema_version, active_id: mockStore.active_id,
         proxy_port: mockStore.proxy_port, sandbox_port: mockStore.sandbox_port,
+        reuse_system_ssh: mockStore.reuse_system_ssh,
         mode: mockStore.mode, templates: MOCK_TEMPLATES,
         profiles: mockStore.profiles.map((p) => ({ ...p })),
       });
@@ -97,7 +99,11 @@ function mockInvoke(cmd, args) {
     case "fetch_models":
       return Promise.resolve({ models: [{ id: "glm-4.6", supports_tools: true }, { id: "glm-5", supports_tools: null }], source: "live", error_kind: null, upstream_status: 200 });
     case "set_settings":
-      if (args.cfg) { mockStore.proxy_port = args.cfg.proxy_port; mockStore.sandbox_port = args.cfg.sandbox_port; }
+      if (args.cfg) {
+        mockStore.proxy_port = args.cfg.proxy_port;
+        mockStore.sandbox_port = args.cfg.sandbox_port;
+        mockStore.reuse_system_ssh = !!args.cfg.reuse_system_ssh;
+      }
       return Promise.resolve(null);
     case "set_mode":
       mockStore.mode = args.mode;
@@ -112,26 +118,6 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
     case "boot_error":
       return Promise.resolve(null);
-    case "ssh_tunnel_info": {
-      const target = String((args.req && args.req.target) || "").trim();
-      const sshPort = Number(args.req && args.req.ssh_port);
-      if (!/^(?!-)[A-Za-z0-9._@:\[\]%-]{1,255}$/.test(target)) {
-        return Promise.reject("SSH 目标格式无效");
-      }
-      if (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) {
-        return Promise.reject("SSH 端口必须是 1-65535");
-      }
-      const portFlag = sshPort === 22 ? "" : " -p " + sshPort;
-      const quotedTarget = "'" + target + "'";
-      return Promise.resolve({
-        command: "ssh -F /dev/null -N -T" + portFlag + " -o StrictHostKeyChecking=ask -o ExitOnForwardFailure=yes -L 127.0.0.1:8990:127.0.0.1:8990 -L 127.0.0.1:8991:127.0.0.1:8991 " + quotedTarget,
-        login_command: "ssh -F /dev/null -T" + portFlag + " -o StrictHostKeyChecking=ask " + quotedTarget + " '<fixed Science url command>'",
-        science_port: 8990,
-        preview_port: 8991,
-        gateway_forwarded: false,
-        warning: "预览模式：命令只转发 Science 与预览端口，不转发 Gateway。",
-      });
-    }
     case "app_version":
       return Promise.resolve("0.0.0-preview");
     case "run_doctor":
@@ -151,10 +137,9 @@ let activationOp = null;
 let busyMsgTimers = [];
 let doctorInFlight = false;
 let statusRecoveryMsg = "";
-let sshAccessClearTimer = null;
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
-let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990 };
+let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false };
 let pendingSkipActivateId = null;   // set_active 校验含糊时，允许「跳过验证」再切
 let pendingConfirm = null;          // 危险操作（清 key / 删除）的「再点一次确认」态
 
@@ -413,7 +398,7 @@ function setBusy(on, op) {
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
     els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
     // 端口输入也纳入忙碌禁用：忙碌中改端口会与在途操作竞态（修 P1-c 前端侧）。
-    els.proxyPort, els.sandboxPort, els.sshTarget, els.sshPort, els.sshGenerateBtn,
+    els.proxyPort, els.sandboxPort, els.reuseSystemSsh,
   ].forEach((b) => b && (b.disabled = on));
   if (els.doctorBtn) els.doctorBtn.disabled = on && !activationBusy;
   // 模式切换按钮同样禁用：忙碌中切官方会与「一键开始」竞态（修 P1-b 前端侧）。
@@ -427,12 +412,12 @@ function setBusy(on, op) {
 function syncActivationControls() {
   const writeLocked = busy;
   [
-    els.newBtn, els.proxyPort, els.sandboxPort,
+    els.newBtn, els.proxyPort, els.sandboxPort, els.reuseSystemSsh,
     els.connClearBtn, els.metaSaveBtn,
   ].forEach((b) => b && (b.disabled = writeLocked));
   if (els.modeSeg) els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => (b.disabled = writeLocked));
   if (els.skipActivateBtn) els.skipActivateBtn.disabled = busy;
-  if (els.sshGenerateBtn) els.sshGenerateBtn.disabled = busy || activationInFlight;
+  if (els.reuseSystemSsh) els.reuseSystemSsh.disabled = busy || activationInFlight;
   syncProfileBusyState();
   refreshWizGate();
   refreshConnGate();
@@ -498,8 +483,10 @@ async function loadConfig() {
     configState.active_id = cfg.active_id || "";
     configState.proxy_port = cfg.proxy_port ?? 18991;
     configState.sandbox_port = cfg.sandbox_port ?? 8990;
+    configState.reuse_system_ssh = !!cfg.reuse_system_ssh;
     els.proxyPort.value = configState.proxy_port;
     els.sandboxPort.value = configState.sandbox_port;
+    els.reuseSystemSsh.checked = configState.reuse_system_ssh;
     applyMode(cfg.mode === "official" ? "official" : "proxy");
     renderList();
     showView("list");
@@ -580,7 +567,6 @@ async function switchMode(m) {
     setBusy(false);
     return;
   }
-  clearSshAccess();
   applyMode(m);
   setBusy(false);
   showView("list");
@@ -611,24 +597,29 @@ async function heroClick() {
   else await oneClick();
 }
 
-// ── 端口设置（替旧 set_config；纯端口，不含 provider/连接）──
-async function persistPorts() {
+// ── 运行设置（端口 + 系统 SSH 配置授权；不含 provider/连接）──
+async function persistRuntimeSettings() {
   if (busy) return; // 忙碌中不改端口（防与在途操作竞态；输入亦已禁用，此为双保险）。修 P1-c
   const p = parseInt(els.proxyPort.value, 10) || 18991;
   const s = parseInt(els.sandboxPort.value, 10) || 8990;
-  const changed = p !== configState.proxy_port || s !== configState.sandbox_port;
-  if (changed) clearSshAccess();
+  const reuseSystemSsh = !!els.reuseSystemSsh.checked;
+  const portsChanged = p !== configState.proxy_port || s !== configState.sandbox_port;
+  const sshChanged = reuseSystemSsh !== configState.reuse_system_ssh;
+  const changed = portsChanged || sshChanged;
   // 本次端口提交全程置忙：仅靠开头的 `if (busy) return` 只挡「已在忙时进入」，挡不住本函数在途
   // 时其它操作（切模式/一键/连接编辑）启动。置忙 + 禁用控件才能保证操作顺序符合用户预期。修 GPT 三轮 P2
   setBusy(true, { kind: "ports" });
   startPortSaveFeedback(changed);
   try {
-    await call("set_settings", { cfg: { proxy_port: p, sandbox_port: s } });
+    await call("set_settings", { cfg: { proxy_port: p, sandbox_port: s, reuse_system_ssh: reuseSystemSsh } });
     configState.proxy_port = p;
     configState.sandbox_port = s;
+    configState.reuse_system_ssh = reuseSystemSsh;
     // 后端在端口变化时会拆掉旧代理/沙箱（否则会复用指向旧端口的死链路），如实告知需重开。修 P1-c
     if (changed) {
-      setMsg("端口已保存。改端口会重置正在运行的代理/沙箱，请重新「一键开始」。", "ok");
+      setMsg(sshChanged
+        ? "SSH 授权设置已保存。正在运行的代理/沙箱已重置，请重新「一键开始」。"
+        : "端口已保存。改端口会重置正在运行的代理/沙箱，请重新「一键开始」。", "ok");
       await refreshStatus();
     } else {
       setMsg("端口未变化。", "ok");
@@ -637,80 +628,10 @@ async function persistPorts() {
     // 出错＝端口未落盘（校验不过 / 停旧沙箱失败）：把输入框还原成实际生效值，避免显示未保存的数字。
     els.proxyPort.value = configState.proxy_port;
     els.sandboxPort.value = configState.sandbox_port;
+    els.reuseSystemSsh.checked = configState.reuse_system_ssh;
     setMsg(String(e), "err");
   } finally {
     setBusy(false);
-  }
-}
-
-function clearSshAccess(clearedMessage) {
-  const hadGeneratedAccess = !!(
-    (els.sshCommand && els.sshCommand.value) ||
-    (els.sshLoginCommand && els.sshLoginCommand.value) ||
-    (els.sshResult && !els.sshResult.hidden)
-  );
-  if (sshAccessClearTimer) clearTimeout(sshAccessClearTimer);
-  sshAccessClearTimer = null;
-  if (els.sshTarget) els.sshTarget.value = "";
-  if (els.sshCommand) els.sshCommand.value = "";
-  if (els.sshLoginCommand) els.sshLoginCommand.value = "";
-  if (els.sshWarning) els.sshWarning.textContent = "";
-  if (els.sshResult) els.sshResult.hidden = true;
-  if (clearedMessage && hadGeneratedAccess) setMsg(clearedMessage);
-}
-
-async function generateSshAccess() {
-  if (busy || activationInFlight) {
-    setMsg("Science 或代理仍在切换，请等待当前操作完成后再生成 SSH 入口。", "err");
-    return;
-  }
-  const target = els.sshTarget.value.trim();
-  const sshPort = Number.parseInt(els.sshPort.value, 10);
-  if (!target) {
-    setMsg("请填写 SSH 目标，例如 user@server。", "err");
-    return;
-  }
-  if (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65535) {
-    setMsg("SSH 端口必须是 1-65535。", "err");
-    return;
-  }
-  clearSshAccess();
-  setBusy(true, { kind: "sshAccess" });
-  setMsg("正在确认隔离 Science 身份并生成 SSH 访问命令…");
-  try {
-    const info = await call("ssh_tunnel_info", { req: { target, ssh_port: sshPort } });
-    els.sshCommand.value = info.command || "";
-    els.sshLoginCommand.value = info.login_command || "";
-    els.sshWarning.textContent = info.warning || "";
-    els.sshResult.hidden = false;
-    setMsg("SSH 命令已生成。一次性链接只会在访问端终端执行登录命令后出现。", "ok");
-    sshAccessClearTimer = setTimeout(
-      () => clearSshAccess("SSH 访问命令已自动清除，请按需重新生成。"),
-      180000
-    );
-  } catch (e) {
-    setMsg("生成 SSH 访问资料失败：" + e, "err");
-  } finally {
-    setBusy(false);
-  }
-}
-
-async function copySshField(field, label) {
-  const value = field && field.value;
-  if (!value) return;
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(value);
-    } else {
-      field.focus();
-      field.select();
-      if (!document.execCommand("copy")) throw new Error("copy unavailable");
-    }
-    setMsg(label + "已复制。登录命令本身不含一次性 token。", "ok");
-  } catch (_) {
-    field.focus();
-    field.select();
-    setMsg("自动复制失败，已选中文本，请手动复制。", "err");
   }
 }
 
@@ -1127,7 +1048,6 @@ function showRuntimeChoice(preflight) {
 
 async function runOneClick(runtimeChoice) {
   hideRuntimeChoice();
-  clearSshAccess();
   setBusy(true, { kind: "oneClick" });
   startOneClickFeedback();
   try {
@@ -1148,7 +1068,6 @@ async function oneClick() {
     setMsg("还没有「当前生效」的配置。请先「＋ 新建」或在列表点「设为当前」选一条，再一键开始。", "err");
     return;
   }
-  clearSshAccess();
   setBusy(true, { kind: "oneClick" });
   setMsg("正在确认本次使用的 Claude Science…");
   try {
@@ -1184,7 +1103,6 @@ function cancelRuntimeChoice() {
 }
 
 async function stopAll() {
-  clearSshAccess();
   setBusy(true);
   setMsg("停止中…");
   try {
@@ -1273,10 +1191,8 @@ async function refreshStatus() {
     setLight(els.ltUpstream, s.upstream);
     els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
     setStatusRecoveryMsg(proxyRecoveryMessage(s));
-    if (s.sandbox !== "green") clearSshAccess();
   } catch (e) {
     [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "amber"));
-    clearSshAccess();
   }
 }
 
@@ -1285,9 +1201,7 @@ function wire() {
     "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream",
     "runtimeChoiceSec", "runtimeChoiceText", "runtimeUseCacheBtn", "runtimeDownloadBtn", "runtimeChoiceCancelBtn",
     "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
-    "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "advSec",
-    "sshTarget", "sshPort", "sshGenerateBtn", "sshResult", "sshCommand", "sshCopyCommandBtn",
-    "sshLoginCommand", "sshCopyLoginCommandBtn", "sshWarning",
+    "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "reuseSystemSsh", "advSec",
     "listSec", "profileList", "newBtn", "skipActivateBtn",
     "wizSec", "wizTemplate", "wizTemplateChips", "wizTplLabel", "wizTplHint", "wizName", "wizBase", "wizBaseHint",
     "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelHint", "wizKey", "wizSaveBtn", "wizCancelBtn",
@@ -1301,14 +1215,9 @@ function wire() {
     b.addEventListener("click", () => switchMode(b.dataset.mode))
   );
 
-  els.proxyPort.addEventListener("change", persistPorts);
-  els.sandboxPort.addEventListener("change", persistPorts);
-  els.sshGenerateBtn.addEventListener("click", generateSshAccess);
-  els.advSec.addEventListener("toggle", () => {
-    if (!els.advSec.open) clearSshAccess("SSH 访问命令已清除，请按需重新生成。");
-  });
-  els.sshCopyCommandBtn.addEventListener("click", () => copySshField(els.sshCommand, "隧道命令"));
-  els.sshCopyLoginCommandBtn.addEventListener("click", () => copySshField(els.sshLoginCommand, "登录命令"));
+  els.proxyPort.addEventListener("change", persistRuntimeSettings);
+  els.sandboxPort.addEventListener("change", persistRuntimeSettings);
+  els.reuseSystemSsh.addEventListener("change", persistRuntimeSettings);
 
   // 列表行内操作（事件委托；忙碌时忽略）。
   els.profileList.addEventListener("click", (e) => {
@@ -1365,7 +1274,6 @@ function wire() {
     call("open_logs").catch((e) => setMsg("打开日志失败：" + e, "err"))
   );
   els.quitBtn.addEventListener("click", () => {
-    clearSshAccess();
     setBusy(true);
     setMsg("正在停止代理与隔离 Science…");
     call("quit_app").catch((e) => {

@@ -106,22 +106,12 @@
           <div class="fld"><label for="sandboxPort">沙箱端口</label><input id="sandboxPort" inputmode="numeric" value="8990" /></div>
         </div>
         <div class="remote-access">
-          <label>SSH 安全入口（不开放公网监听）</label>
-          <div class="ports">
-            <div class="fld"><label for="sshTarget">SSH 目标</label><input id="sshTarget" type="text" placeholder="user@server" autocomplete="off" spellcheck="false" /></div>
-            <div class="fld ssh-port"><label for="sshPort">SSH 端口</label><input id="sshPort" inputmode="numeric" value="22" /></div>
-          </div>
-          <button type="button" class="btn small" id="sshGenerateBtn">生成 SSH 访问命令</button>
-          <div id="sshResult" hidden>
-            <label for="sshCommand">在访问端电脑运行</label>
-            <textarea id="sshCommand" class="ssh-command" readonly spellcheck="false"></textarea>
-            <button type="button" class="btn small" id="sshCopyCommandBtn">复制命令</button>
-            <label for="sshLoginCommand">在另一个访问端终端生成一次性链接</label>
-            <textarea id="sshLoginCommand" class="ssh-command" readonly spellcheck="false"></textarea>
-            <button type="button" class="btn small" id="sshCopyLoginCommandBtn">复制登录命令</button>
-            <div class="hint" id="sshWarning"></div>
-          </div>
-          <div class="hint">CSSwitch 不启动 SSH、不修改远程登录或防火墙；Gateway 端口不会被转发。</div>
+          <label class="ssh-bridge-toggle" for="reuseSystemSsh">
+            <input id="reuseSystemSsh" type="checkbox" />
+            <span>允许隔离 Science 使用系统 SSH 配置</span>
+          </label>
+          <div class="hint">启用后，Science 调用系统 OpenSSH 时会读取你的 <code>~/.ssh/config</code>。Include、IdentityFile、IdentityAgent、ProxyCommand 和 Match exec 按 OpenSSH 原规则生效；CSSwitch 不复制或链接整个 <code>.ssh</code>，也不启动 sshd 或开放端口。</div>
+          <div class="hint">这相当于授权该隔离 Science 实例使用你已有的 SSH 身份；更改后需要重新「一键开始」。</div>
         </div>
       </details>
 

@@ -17,13 +17,11 @@ use crate::runtime::provider::{
     status_upstream_endpoint,
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
-use crate::runtime::remote_access::build_ssh_tunnel_plan;
 use crate::runtime::science::{
-    probe_known_runtime, science_runtime_preflight as runtime_preflight,
-    settings_change_needs_teardown, stop_sandbox, SandboxScienceState, ScienceRuntimeIdentity,
+    science_runtime_preflight as runtime_preflight, settings_change_needs_teardown, stop_sandbox,
     SCIENCE_DOWNLOAD_URL,
 };
-use crate::runtime::settings::validate_runtime_ports;
+use crate::runtime::settings::{system_ssh_config_path, validate_runtime_ports};
 use crate::runtime::system::open_in_browser;
 use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
 
@@ -154,10 +152,12 @@ pub(crate) fn open_official() -> Result<(), String> {
 pub(crate) struct UiSettings {
     proxy_port: u16,
     sandbox_port: u16,
+    #[serde(default)]
+    reuse_system_ssh: bool,
 }
 
-/// 端口设置（provider/连接改走 profile CRUD + set_active_profile）。
-/// 经串行器（修 P1-c）：端口一旦变化，正在跑的代理绑在旧端口、正在跑的沙箱又烘死了旧代理 URL，
+/// 运行设置（端口 + 系统 SSH 配置授权；provider/连接改走 profile CRUD + set_active_profile）。
+/// 经串行器（修 P1-c）：端口或 SSH 授权一旦变化，正在跑的沙箱都必须拆掉，
 /// 与新端口不一致；此处把这条陈旧链路拆掉（只停我们的沙箱、绝不碰 8765），逼下次「一键开始」按新端口重建，
 /// 杜绝「复用旧沙箱指向死端口、UI 却报沿用不变」。
 #[tauri::command]
@@ -179,6 +179,9 @@ fn set_settings_inner(
     cfg: UiSettings,
 ) -> Result<(), String> {
     validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port)?;
+    if cfg.reuse_system_ssh {
+        system_ssh_config_path()?;
+    }
     lifecycle.with_serialized(|| {
         let dir = config::default_dir();
         let old = config::load_from(&dir).map_err(|e| e.to_string())?;
@@ -187,7 +190,7 @@ fn set_settings_inner(
             cfg.proxy_port,
             old.sandbox_port,
             cfg.sandbox_port,
-        );
+        ) || old.reuse_system_ssh != cfg.reuse_system_ssh;
         // 拆链路【先】于落盘，且停沙箱结果必须据实处理（修增量 P1）：停不掉就【不改端口】——
         // 否则会留下「config 已是新端口、旧沙箱仍在旧端口指向旧代理」的不一致态，下次一键还会复用这条死链路。
         // 保持端口不变则一切仍自洽（旧沙箱指旧代理端口、下次一键在旧端口重建代理，链路照通）。
@@ -195,7 +198,7 @@ fn set_settings_inner(
             let mut st = lock(&state);
             stop_sandbox_state(&app, &mut st).map_err(|e| {
                 format!(
-                    "端口未更改：无法停止指向旧端口的沙箱（{e}），为避免留下失效链路，端口保持不变。请手动停止沙箱或重启 app 后重试。（真实实例 8765 未受影响）"
+                    "设置未更改：无法停止仍使用旧端口或旧 SSH 授权的沙箱（{e}）。请手动停止沙箱或重启 app 后重试。（真实实例 8765 未受影响）"
                 )
             })?;
             lifecycle.bump_generation(); // 停成功后作废在途启动
@@ -205,6 +208,7 @@ fn set_settings_inner(
         config::update(&dir, move |c| {
             c.proxy_port = cfg.proxy_port;
             c.sandbox_port = cfg.sandbox_port;
+            c.reuse_system_ssh = cfg.reuse_system_ssh;
         })
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -475,56 +479,6 @@ pub(crate) fn open_url(state: State<'_, SharedAppState>) -> Result<(), String> {
     let url = { lock(state.inner()).sandbox_url.clone() };
     let url = url.ok_or("还没有沙箱 URL，请先「一键开始」。")?;
     open_in_browser(&url)
-}
-
-#[derive(Deserialize)]
-pub(crate) struct SshTunnelReq {
-    target: String,
-    #[serde(default = "default_ssh_port")]
-    ssh_port: u16,
-}
-
-fn default_ssh_port() -> u16 {
-    22
-}
-
-fn ssh_tunnel_info_inner(
-    req: SshTunnelReq,
-    runtime: ScienceRuntimeIdentity,
-) -> Result<serde_json::Value, String> {
-    let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
-    let science_port = cfg.sandbox_port;
-    if probe_known_runtime(science_port, &runtime) != SandboxScienceState::RunningHealthy {
-        return Err("隔离 Science 尚未健康运行；请先完成「一键开始」。".to_string());
-    }
-    let plan = build_ssh_tunnel_plan(
-        &req.target,
-        req.ssh_port,
-        science_port,
-        cfg.proxy_port,
-        runtime.source,
-    )?;
-    Ok(json!({
-        "command": plan.command,
-        "login_command": plan.login_command,
-        "science_port": science_port,
-        "preview_port": plan.preview_port,
-        "gateway_forwarded": false,
-        "warning": "先在访问端终端保持隧道命令运行，再在另一个终端运行登录命令。一次性链接只会出现在访问端终端，不进入 CSSwitch 前端、配置或日志。",
-    }))
-}
-
-/// Generate client-side SSH forwarding instructions. CSSwitch never starts SSH or changes sshd.
-#[tauri::command]
-pub(crate) async fn ssh_tunnel_info(
-    state: State<'_, SharedAppState>,
-    req: SshTunnelReq,
-) -> Result<serde_json::Value, String> {
-    let runtime = lock(state.inner())
-        .science_runtime
-        .clone()
-        .ok_or("CSSwitch 尚未记录可验证的隔离 Science 运行时；请先完成「一键开始」。")?;
-    run_blocking(move || ssh_tunnel_info_inner(req, runtime)).await
 }
 
 #[tauri::command]

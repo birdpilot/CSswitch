@@ -2,7 +2,8 @@
 # 启动 CSSwitch 管理的隔离运行环境。
 # Safety boundaries:
 #   - 独立 HOME + 独立 data-dir + 独立端口，绝不修改/删除真实 ~/.claude-science，绝不用端口 8765
-#   - data-dir 只承载持久化状态；不从真实 HOME 读取或复制任何 runtime 或用户数据
+#   - data-dir 只承载持久化状态；不从真实 Science HOME 读取或复制 runtime 或用户数据
+#   - 系统 SSH 配置仅在用户显式授权时由 OpenSSH 读取；不复制或链接整个 ~/.ssh
 #   - 只使用应用在隔离目录中生成的本地状态，与真实账号无关
 #   - 使用独立的本地钥匙串
 #
@@ -16,9 +17,14 @@ umask 077
 PROJ="${0:A:h:h}"
 SANDBOX_HOME="${SANDBOX_HOME:-$PROJ/.sandbox/home}"
 DATA_DIR="$SANDBOX_HOME/.claude-science"   # = auth_dir（Science 按 HOME 推导）
-REAL_DATA_DIR="$HOME/.claude-science"
+REAL_HOME="$HOME"
+REAL_DATA_DIR="$REAL_HOME/.claude-science"
 APP_BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
 BIN="${SCIENCE_BIN:-}"
+REUSE_SYSTEM_SSH="${CSSWITCH_REUSE_SYSTEM_SSH:-0}"
+SYSTEM_SSH_CONFIG="$REAL_HOME/.ssh/config"
+SSH_BRIDGE_DIR="$PROJ/scripts/ssh-bridge"
+SSH_BRIDGE_BIN="$SSH_BRIDGE_DIR/ssh"
 PORT=8990
 PROXY_URL="${CSSWITCH_PROXY_URL:-http://127.0.0.1:18991}"
 EMAIL="virtual@localhost.invalid"
@@ -67,6 +73,20 @@ _PROXY_PORT="${_PROXY_HOSTPORT##*:}"
 if [[ "$_PROXY_PORT" =~ ^[0-9]+$ ]] && (( 10#${_PROXY_PORT} == PREVIEW_PORT )); then
   echo "拒绝：预览端口 $PREVIEW_PORT 与 CSSwitch Gateway 端口冲突"
   exit 1
+fi
+if [[ "$REUSE_SYSTEM_SSH" != "0" && "$REUSE_SYSTEM_SSH" != "1" ]]; then
+  echo "拒绝：系统 SSH 授权值无效"
+  exit 1
+fi
+if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
+  if [[ ! -f "$SYSTEM_SSH_CONFIG" ]]; then
+    echo "拒绝：未找到系统 ~/.ssh/config，不能启用系统 SSH 配置"
+    exit 1
+  fi
+  if ! is_safe_science_bin "$SSH_BRIDGE_BIN"; then
+    echo "拒绝：CSSwitch SSH bridge 不存在或不是安全的可执行文件"
+    exit 1
+  fi
 fi
 _dd_real="${DATA_DIR:A}"; _real_real="${REAL_DATA_DIR:A}"
 if [[ "$_dd_real" == "$_real_real" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
@@ -133,8 +153,13 @@ echo "启动隔离沙箱 Science（虚拟登录）"
 echo "  HOME     = [CSSwitch isolated]"
 echo "  data-dir = [CSSwitch isolated Science data]"
 echo "  端口     = $PORT   （真实实例 8765 不受影响）"
-echo "  预览端口 = $PREVIEW_PORT   （显式固定，供本机或 SSH 隧道访问）"
+echo "  预览端口 = $PREVIEW_PORT   （显式固定，供本机 Science 预览使用）"
 echo "  二进制   = $BIN_SOURCE"
+if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
+  echo "  系统 SSH = 已显式授权（OpenSSH 读取 ~/.ssh/config；不复制或链接 .ssh）"
+else
+  echo "  系统 SSH = 未授权"
+fi
 # 掩掉 proxy-url 里的 path secret（一次性鉴权令牌不入日志）
 _masked_proxy="$(printf '%s' "$PROXY_URL" | sed -E 's#(://[^/]+/).+#\1****#')"
 echo "  推理指向 = $_masked_proxy"
@@ -150,11 +175,22 @@ if path_contains_symlink "$DATA_DIR"; then
   echo "拒绝：Science data-dir 路径在启动前发生符号链接变化"
   exit 1
 fi
-if ! HOME="$SANDBOX_HOME" \
-  ANTHROPIC_BASE_URL="$PROXY_URL" \
-  https_proxy="$_FASTFAIL_PROXY" HTTPS_PROXY="$_FASTFAIL_PROXY" \
-  no_proxy="$_NO_PROXY" NO_PROXY="$_NO_PROXY" \
-  "$BIN" serve \
+typeset -a _SCIENCE_ENV
+_SCIENCE_ENV=(
+  "HOME=$SANDBOX_HOME"
+  "ANTHROPIC_BASE_URL=$PROXY_URL"
+  "https_proxy=$_FASTFAIL_PROXY"
+  "HTTPS_PROXY=$_FASTFAIL_PROXY"
+  "no_proxy=$_NO_PROXY"
+  "NO_PROXY=$_NO_PROXY"
+)
+if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
+  _SCIENCE_ENV+=(
+    "PATH=$SSH_BRIDGE_DIR:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+    "CSSWITCH_SYSTEM_SSH_CONFIG=$SYSTEM_SSH_CONFIG"
+  )
+fi
+if ! /usr/bin/env "${_SCIENCE_ENV[@]}" "$BIN" serve \
     --data-dir "$DATA_DIR" \
     --host 127.0.0.1 \
     --port "$PORT" \

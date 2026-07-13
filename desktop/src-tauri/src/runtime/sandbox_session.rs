@@ -260,6 +260,10 @@ pub(crate) fn one_click_login<R: Runtime>(
         .env("SANDBOX_HOME", sandbox_home())
         .env("SCIENCE_BIN", &launch_runtime.path)
         .env("CSSWITCH_PROXY_URL", &proxy_url)
+        .env(
+            "CSSWITCH_REUSE_SYSTEM_SSH",
+            if cfg.reuse_system_ssh { "1" } else { "0" },
+        )
         .stdout(Stdio::from(logf))
         .stderr(Stdio::from(logf2))
         .status()
