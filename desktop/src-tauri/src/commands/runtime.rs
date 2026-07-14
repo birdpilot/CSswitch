@@ -79,6 +79,7 @@ fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), S
     let runtime = st.science_runtime.clone();
     let result = stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, runtime.as_ref());
     if result.is_ok() {
+        st.science_confirmed_stopped = runtime;
         st.science_runtime = None;
     }
     result
@@ -336,8 +337,17 @@ pub(crate) fn one_click_login_cmd(
 }
 
 #[tauri::command]
-pub(crate) async fn science_runtime_preflight() -> Result<Value, String> {
-    run_blocking(runtime_preflight).await
+pub(crate) async fn science_runtime_preflight(
+    state: State<'_, SharedAppState>,
+) -> Result<Value, String> {
+    let (version_cache, confirmed_stopped) = {
+        let st = lock(state.inner());
+        (
+            st.science_version_cache.clone(),
+            st.science_confirmed_stopped.clone(),
+        )
+    };
+    run_blocking(move || runtime_preflight(&version_cache, confirmed_stopped.as_ref())).await
 }
 
 #[tauri::command]
@@ -514,7 +524,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         thread,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Instant, SystemTime, UNIX_EPOCH},
     };
     use tauri::Manager;
 
@@ -636,6 +646,9 @@ exit 0
 set -eu
 cmd="${1:-}"
 if [ "$#" -gt 0 ]; then shift; fi
+if [ -n "${CSSWITCH_FAKE_SCIENCE_CALL_LOG:-}" ]; then
+  printf '%s\n' "$cmd" >> "$CSSWITCH_FAKE_SCIENCE_CALL_LOG"
+fi
 if [ "$cmd" = "--version" ]; then
   echo "claude-science 0.0.0-csswitch-test"
   exit 0
@@ -676,6 +689,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"fake science")
+socketserver.TCPServer.allow_reuse_address = True
 with open(pidfile, "w", encoding="utf-8") as f:
     f.write(str(os.getpid()))
 with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
@@ -746,6 +760,36 @@ esac
         panic!("mock service on port {port} remained reachable");
     }
 
+    fn call_count(path: &Path, command: &str) -> usize {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| *line == command)
+            .count()
+    }
+
+    fn stop_test_sandbox<R: tauri::Runtime>(
+        handle: &tauri::AppHandle<R>,
+        state: &SharedAppState,
+        sandbox_port: u16,
+    ) {
+        {
+            let mut st = lock(state);
+            let AppState {
+                sandbox,
+                sandbox_url,
+                science_runtime,
+                science_confirmed_stopped,
+                ..
+            } = &mut *st;
+            let runtime = science_runtime.clone();
+            assert!(science::stop_sandbox(handle, sandbox, sandbox_url, runtime.as_ref()).is_ok());
+            *science_confirmed_stopped = runtime;
+            *science_runtime = None;
+        }
+        wait_http_unreachable(sandbox_port);
+    }
+
     fn kill_tracked_proxy(state: &SharedAppState, proxy_port: u16) {
         let mut proxy_child = {
             let mut st = lock(state);
@@ -773,6 +817,8 @@ esac
         fs::create_dir_all(&home).unwrap();
         let fake_science = write_test_bins(&bin_dir).canonicalize().unwrap();
         let open_log = tmp.join("open.log");
+        let science_call_log = tmp.join("science-call.log");
+        let route_config_log = tmp.join("route-config.log");
         let mock_upstream_port = start_mock_upstream();
         let proxy_port = free_port();
         let sandbox_port = free_port();
@@ -784,6 +830,8 @@ esac
         env_guard.set("SCIENCE_BIN", &fake_science);
         env_guard.set("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY", "1");
         env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
+        env_guard.set("CSSWITCH_FAKE_SCIENCE_CALL_LOG", &science_call_log);
+        env_guard.set("CSSWITCH_TEST_THIRD_PARTY_CONFIG_LOG", &route_config_log);
         env_guard.set("CSSWITCH_DOCTOR_CHECK_REAL_HOME", "0");
         env_guard.set(
             "PATH",
@@ -848,6 +896,10 @@ esac
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
             "1"
         );
+        assert_eq!(call_count(&science_call_log, "--version"), 1);
+        assert_eq!(call_count(&science_call_log, "status"), 1);
+        assert_eq!(call_count(&science_call_log, "url"), 2);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 1);
 
         let second = sandbox_session::one_click_login(
             handle.clone(),
@@ -868,6 +920,95 @@ esac
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
             "1"
+        );
+        assert_eq!(call_count(&science_call_log, "--version"), 1);
+        assert_eq!(call_count(&science_call_log, "status"), 2);
+        assert_eq!(call_count(&science_call_log, "url"), 3);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 1);
+
+        let route_check = lifecycle
+            .with_serialized(|| sandbox_session::force_third_party_reconcile(&handle, &state));
+        assert_eq!(route_check.as_deref(), Ok("Skill 路由已强制核验并同步。"));
+        assert_eq!(call_count(&science_call_log, "--version"), 2);
+        assert_eq!(call_count(&science_call_log, "status"), 3);
+        assert_eq!(call_count(&science_call_log, "url"), 4);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 2);
+
+        stop_test_sandbox(&handle, &state, sandbox_port);
+        let mut cold_start_ms = Vec::new();
+        for cycle in 0..5 {
+            let (version_cache, confirmed_stopped) = {
+                let st = lock(&state);
+                (
+                    st.science_version_cache.clone(),
+                    st.science_confirmed_stopped.clone(),
+                )
+            };
+            let preflight =
+                science::science_runtime_preflight(&version_cache, confirmed_stopped.as_ref())
+                    .expect("confirmed stop should make preflight ready without status CLI");
+            assert_eq!(preflight["status"], "installed_ready");
+            let started_at = Instant::now();
+            let restarted = sandbox_session::one_click_login(
+                handle.clone(),
+                state.clone(),
+                lifecycle.as_ref(),
+                None,
+            )
+            .expect("normal cold start should not re-probe or reconfigure");
+            cold_start_ms.push(started_at.elapsed().as_millis());
+            assert_eq!(restarted["action"], "started");
+            if cycle < 4 {
+                stop_test_sandbox(&handle, &state, sandbox_port);
+            }
+        }
+        let mut sorted_cold_start_ms = cold_start_ms.clone();
+        sorted_cold_start_ms.sort_unstable();
+        eprintln!(
+            "focused cold starts ms={cold_start_ms:?} median_ms={}",
+            sorted_cold_start_ms[2]
+        );
+        assert_eq!(call_count(&science_call_log, "--version"), 2);
+        assert_eq!(call_count(&science_call_log, "status"), 3);
+        assert_eq!(call_count(&science_call_log, "url"), 9);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 2);
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
+            "6"
+        );
+
+        stop_test_sandbox(&handle, &state, sandbox_port);
+        let upgraded_script = fs::read_to_string(&fake_science)
+            .unwrap()
+            .replace("0.0.0-csswitch-test", "0.0.1-csswitch-test");
+        write_executable(&fake_science, &upgraded_script);
+        let (version_cache, confirmed_stopped) = {
+            let st = lock(&state);
+            (
+                st.science_version_cache.clone(),
+                st.science_confirmed_stopped.clone(),
+            )
+        };
+        assert_eq!(
+            science::science_runtime_preflight(&version_cache, confirmed_stopped.as_ref()).unwrap()
+                ["status"],
+            "installed_ready"
+        );
+        let upgraded = sandbox_session::one_click_login(
+            handle.clone(),
+            state.clone(),
+            lifecycle.as_ref(),
+            None,
+        )
+        .expect("binary replacement should re-probe and reconcile once");
+        assert_eq!(upgraded["action"], "started");
+        assert_eq!(call_count(&science_call_log, "--version"), 3);
+        assert_eq!(call_count(&science_call_log, "status"), 3);
+        assert_eq!(call_count(&science_call_log, "url"), 11);
+        assert_eq!(call_count(&route_config_log, "configure-third-party"), 3);
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
+            "7"
         );
 
         let status = super::status(app.state::<SharedAppState>());

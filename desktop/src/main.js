@@ -383,7 +383,7 @@ function startPortSaveFeedback(changed) {
 function startDoctorFeedback() {
   clearBusyMsgTimers();
   setMsg("自检中：正在运行本地诊断脚本…");
-  scheduleBusyMsg(3500, { kind: "doctor" }, "自检仍在运行。它只检查本地依赖、端口和当前配置摘要，不会读取真实 Science HOME，也不会传出、打印或展示完整 key。");
+  scheduleBusyMsg(3500, { kind: "doctor" }, "自检仍在运行。它会检查本地依赖、端口、配置摘要和 CSSwitch 管理的 Skill 路由；不会读取真实 Science HOME，也不会传出、打印或展示完整 key。");
 }
 
 function setBusy(on, op) {
@@ -1130,7 +1130,7 @@ async function runDoctor() {
   doctorInFlight = true;
   if (els.doctorBtn) els.doctorBtn.disabled = true;
   if (activationBusy) {
-    setMsg("自检中：配置后台应用仍在继续。自检只读取当前配置摘要和本地依赖状态。");
+    setMsg("自检中：配置后台应用仍在继续。完成后会核验 CSSwitch 管理的 Skill 路由。");
   } else {
     setBusy(true, { kind: "doctor" });
     startDoctorFeedback();

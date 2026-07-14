@@ -90,6 +90,10 @@ pub(crate) struct AppState {
     pub(crate) sandbox_url: Option<String>,
     /// 当前 CSSwitch Science daemon 的实际 binary 身份，仅存内存；绝不形成版本偏好。
     pub(crate) science_runtime: Option<runtime::science::ScienceRuntimeIdentity>,
+    /// CSSwitch 自己成功停止后的单次快速启动令牌；下一次启动消费，App 重启即丢弃。
+    pub(crate) science_confirmed_stopped: Option<runtime::science::ScienceRuntimeIdentity>,
+    /// Science 版本探测缓存与 daemon 身份分离；停止 daemon 后仍可复用未变化二进制的版本。
+    pub(crate) science_version_cache: runtime::science::ScienceVersionCache,
     boot: BootState,
     pub(crate) boot_error: Option<String>,
 }

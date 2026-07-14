@@ -1,6 +1,8 @@
-use std::os::unix::fs::PermissionsExt;
+use std::collections::HashMap;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -37,6 +39,87 @@ pub(crate) struct ScienceRuntimeIdentity {
     pub(crate) path: PathBuf,
     pub(crate) source: ScienceRuntimeSource,
     pub(crate) version: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScienceExecutableFingerprint {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    mode: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ScienceVersionCacheEntry {
+    fingerprint: ScienceExecutableFingerprint,
+    version: String,
+}
+
+/// Successful Science `--version` results, shared for one CSSwitch process.
+///
+/// The dedicated inner lock serializes only the rare version probe. It never
+/// holds the broader AppState lock while launching an external process.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScienceVersionCache {
+    entries: Arc<Mutex<HashMap<PathBuf, ScienceVersionCacheEntry>>>,
+}
+
+impl ScienceVersionCache {
+    fn version(&self, path: &Path) -> Option<String> {
+        self.version_inner(path, false)
+    }
+
+    pub(crate) fn force_refresh(&self, path: &Path) -> Option<String> {
+        self.version_inner(path, true)
+    }
+
+    fn version_inner(&self, path: &Path, force: bool) -> Option<String> {
+        let mut force = force;
+        for _ in 0..2 {
+            let fingerprint = science_executable_fingerprint(path)?;
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if force {
+                entries.remove(path);
+                force = false;
+            } else if let Some(entry) = entries.get(path) {
+                if entry.fingerprint == fingerprint {
+                    return Some(entry.version.clone());
+                }
+                entries.remove(path);
+            }
+
+            let version = safe_science_version(path)?;
+            let Some(after) = science_executable_fingerprint(path) else {
+                entries.remove(path);
+                return None;
+            };
+            if after != fingerprint {
+                entries.remove(path);
+                continue;
+            }
+            entries.insert(
+                path.to_path_buf(),
+                ScienceVersionCacheEntry {
+                    fingerprint,
+                    version: version.clone(),
+                },
+            );
+            return Some(version);
+        }
+        None
+    }
+
+    pub(crate) fn clear(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
 }
 
 /// 沙箱可写工作目录（独立 HOME）：`~/.csswitch/sandbox/home`。
@@ -96,6 +179,21 @@ fn is_explicit_executable_file(path: &Path) -> bool {
     is_executable_file(path)
 }
 
+fn science_executable_fingerprint(path: &Path) -> Option<ScienceExecutableFingerprint> {
+    if !is_executable_file(path) {
+        return None;
+    }
+    let metadata = path.metadata().ok()?;
+    Some(ScienceExecutableFingerprint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.size(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        mode: metadata.mode(),
+    })
+}
+
 fn cached_science_bin(data_dir: &Path) -> PathBuf {
     data_dir.join("bin").join("claude-science")
 }
@@ -122,8 +220,12 @@ fn safe_science_version(path: &Path) -> Option<String> {
     Some(value.to_string())
 }
 
-fn runtime_identity(path: PathBuf, source: ScienceRuntimeSource) -> ScienceRuntimeIdentity {
-    let version = safe_science_version(&path);
+fn runtime_identity(
+    path: PathBuf,
+    source: ScienceRuntimeSource,
+    version_cache: &ScienceVersionCache,
+) -> ScienceRuntimeIdentity {
+    let version = version_cache.version(&path);
     ScienceRuntimeIdentity {
         path,
         source,
@@ -141,17 +243,33 @@ fn explicit_science_bin() -> Result<Option<PathBuf>, String> {
     Ok(Some(path))
 }
 
+#[cfg(test)]
 fn science_runtime_preflight_for_paths(
     data_dir: &Path,
     explicit_bin: Option<&Path>,
     app_bin: &Path,
 ) -> Result<Value, String> {
+    science_runtime_preflight_for_paths_cached(
+        data_dir,
+        explicit_bin,
+        app_bin,
+        &ScienceVersionCache::default(),
+    )
+}
+
+fn science_runtime_preflight_for_paths_cached(
+    data_dir: &Path,
+    explicit_bin: Option<&Path>,
+    app_bin: &Path,
+    version_cache: &ScienceVersionCache,
+) -> Result<Value, String> {
     if let Some(bin) = explicit_bin {
         if !is_explicit_executable_file(bin) {
             return Err("显式 SCIENCE_BIN 不是安全的绝对可执行文件；已拒绝回退".into());
         }
-        let version =
-            safe_science_version(bin).ok_or("显式 SCIENCE_BIN 未通过版本预检；已拒绝回退")?;
+        let version = version_cache
+            .version(bin)
+            .ok_or("显式 SCIENCE_BIN 未通过版本预检；已拒绝回退")?;
         return Ok(json!({
             "status": "installed_ready",
             "selected_source": ScienceRuntimeSource::Explicit.code(),
@@ -160,10 +278,7 @@ fn science_runtime_preflight_for_paths(
             "download_url": SCIENCE_DOWNLOAD_URL,
         }));
     }
-    if let Some(version) = is_executable_file(app_bin)
-        .then(|| safe_science_version(app_bin))
-        .flatten()
-    {
+    if let Some(version) = version_cache.version(app_bin) {
         return Ok(json!({
             "status": "installed_ready",
             "selected_source": ScienceRuntimeSource::InstalledApp.code(),
@@ -173,9 +288,7 @@ fn science_runtime_preflight_for_paths(
         }));
     }
     let cached = cached_science_bin(data_dir);
-    let cached_version = is_executable_file(&cached)
-        .then(|| safe_science_version(&cached))
-        .flatten();
+    let cached_version = version_cache.version(&cached);
     if let Some(version) = cached_version {
         return Ok(json!({
             "status": "cached_choice_required",
@@ -194,9 +307,27 @@ fn science_runtime_preflight_for_paths(
     }))
 }
 
-pub(crate) fn science_runtime_preflight() -> Result<Value, String> {
+pub(crate) fn science_runtime_preflight(
+    version_cache: &ScienceVersionCache,
+    confirmed_stopped: Option<&ScienceRuntimeIdentity>,
+) -> Result<Value, String> {
     if let Ok(cfg) = config::load_from(&config::default_dir()) {
-        let (state, runtime) = probe_sandbox_runtime(cfg.sandbox_port)?;
+        if let Some(runtime) = confirmed_stopped {
+            if runtime.source != ScienceRuntimeSource::CachedOnce
+                && !loopback_port_accepts_tcp(cfg.sandbox_port)
+            {
+                if let Some(version) = version_cache.version(&runtime.path) {
+                    return Ok(json!({
+                        "status": "installed_ready",
+                        "selected_source": runtime.source.code(),
+                        "selected_version": version,
+                        "cached_version": Value::Null,
+                        "download_url": SCIENCE_DOWNLOAD_URL,
+                    }));
+                }
+            }
+        }
+        let (state, runtime) = probe_sandbox_runtime_cached(cfg.sandbox_port, version_cache)?;
         if state == SandboxScienceState::RunningHealthy {
             let runtime = runtime.ok_or("Science 状态为运行中，但无法确认其 binary 身份")?;
             return Ok(json!({
@@ -210,31 +341,51 @@ pub(crate) fn science_runtime_preflight() -> Result<Value, String> {
     }
     let data_dir = sandbox_data_dir();
     let explicit = explicit_science_bin()?;
-    science_runtime_preflight_for_paths(&data_dir, explicit.as_deref(), Path::new(SCIENCE_BIN))
+    science_runtime_preflight_for_paths_cached(
+        &data_dir,
+        explicit.as_deref(),
+        Path::new(SCIENCE_BIN),
+        version_cache,
+    )
 }
 
+#[cfg(test)]
 fn select_science_runtime_for_paths(
     data_dir: &Path,
     explicit_bin: Option<&Path>,
     app_bin: &Path,
     choice: Option<&str>,
 ) -> Result<ScienceRuntimeIdentity, String> {
+    select_science_runtime_for_paths_cached(
+        data_dir,
+        explicit_bin,
+        app_bin,
+        choice,
+        &ScienceVersionCache::default(),
+    )
+}
+
+fn select_science_runtime_for_paths_cached(
+    data_dir: &Path,
+    explicit_bin: Option<&Path>,
+    app_bin: &Path,
+    choice: Option<&str>,
+    version_cache: &ScienceVersionCache,
+) -> Result<ScienceRuntimeIdentity, String> {
     if let Some(bin) = explicit_bin {
         if !is_explicit_executable_file(bin) {
             return Err("显式 SCIENCE_BIN 不是安全的绝对可执行文件；已拒绝回退".into());
         }
-        let version =
-            safe_science_version(bin).ok_or("显式 SCIENCE_BIN 未通过版本预检；已拒绝回退")?;
+        let version = version_cache
+            .version(bin)
+            .ok_or("显式 SCIENCE_BIN 未通过版本预检；已拒绝回退")?;
         return Ok(ScienceRuntimeIdentity {
             path: bin.to_path_buf(),
             source: ScienceRuntimeSource::Explicit,
             version: Some(version),
         });
     }
-    if let Some(version) = is_executable_file(app_bin)
-        .then(|| safe_science_version(app_bin))
-        .flatten()
-    {
+    if let Some(version) = version_cache.version(app_bin) {
         return Ok(ScienceRuntimeIdentity {
             path: app_bin.to_path_buf(),
             source: ScienceRuntimeSource::InstalledApp,
@@ -242,9 +393,7 @@ fn select_science_runtime_for_paths(
         });
     }
     let cached = cached_science_bin(data_dir);
-    let cached_version = is_executable_file(&cached)
-        .then(|| safe_science_version(&cached))
-        .flatten();
+    let cached_version = version_cache.version(&cached);
     if choice == Some(CACHED_ONCE_CHOICE) {
         let version = cached_version
             .ok_or("缓存 Science 版本无法确认；请安装或更新 Claude Science 后再试")?;
@@ -260,34 +409,47 @@ fn select_science_runtime_for_paths(
     Err("找不到可用的 Claude Science App；请先安装或更新 Claude Science".into())
 }
 
-pub(crate) fn select_science_runtime(
+pub(crate) fn select_science_runtime_cached(
     choice: Option<&str>,
+    version_cache: &ScienceVersionCache,
 ) -> Result<ScienceRuntimeIdentity, String> {
     let data_dir = sandbox_data_dir();
     let explicit = explicit_science_bin()?;
-    select_science_runtime_for_paths(
+    select_science_runtime_for_paths_cached(
         &data_dir,
         explicit.as_deref(),
         Path::new(SCIENCE_BIN),
         choice,
+        version_cache,
     )
 }
 
-fn runtime_probe_candidates() -> Result<Vec<ScienceRuntimeIdentity>, String> {
+fn runtime_probe_candidates(
+    version_cache: &ScienceVersionCache,
+) -> Result<Vec<ScienceRuntimeIdentity>, String> {
     if let Some(explicit) = explicit_science_bin()? {
         return Ok(vec![runtime_identity(
             explicit,
             ScienceRuntimeSource::Explicit,
+            version_cache,
         )]);
     }
     let mut candidates = Vec::new();
     let app = PathBuf::from(SCIENCE_BIN);
-    if is_executable_file(&app) && safe_science_version(&app).is_some() {
-        candidates.push(runtime_identity(app, ScienceRuntimeSource::InstalledApp));
+    if version_cache.version(&app).is_some() {
+        candidates.push(runtime_identity(
+            app,
+            ScienceRuntimeSource::InstalledApp,
+            version_cache,
+        ));
     }
     let cached = cached_science_bin(&sandbox_data_dir());
-    if is_executable_file(&cached) && safe_science_version(&cached).is_some() {
-        candidates.push(runtime_identity(cached, ScienceRuntimeSource::CachedOnce));
+    if version_cache.version(&cached).is_some() {
+        candidates.push(runtime_identity(
+            cached,
+            ScienceRuntimeSource::CachedOnce,
+            version_cache,
+        ));
     }
     Ok(candidates)
 }
@@ -487,9 +649,16 @@ pub(crate) fn probe_known_runtime(
 pub(crate) fn probe_sandbox_runtime(
     port: u16,
 ) -> Result<(SandboxScienceState, Option<ScienceRuntimeIdentity>), String> {
+    probe_sandbox_runtime_cached(port, &ScienceVersionCache::default())
+}
+
+pub(crate) fn probe_sandbox_runtime_cached(
+    port: u16,
+    version_cache: &ScienceVersionCache,
+) -> Result<(SandboxScienceState, Option<ScienceRuntimeIdentity>), String> {
     let health_ready = proc::http_health(port, None, 400);
     let port_accepts_tcp = health_ready || loopback_port_accepts_tcp(port);
-    let candidates = runtime_probe_candidates()?;
+    let candidates = runtime_probe_candidates(version_cache)?;
     let no_candidates = candidates.is_empty();
     let mut saw_stopped = false;
     let mut saw_running_unconfirmed = false;
@@ -533,8 +702,18 @@ fn stop_runtime_from_probe(
 
 /// Check that the sandbox Science associated with our data-dir is running.
 /// A naked `/health` response is not sufficient identity proof.
+#[cfg(test)]
 pub(crate) fn sandbox_running_ours(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
     probe_known_runtime(port, runtime) == SandboxScienceState::RunningHealthy
+}
+
+/// The caller has just observed a healthy response and only needs to prove the
+/// listener executable identity; avoid repeating status and health CLI work.
+pub(crate) fn sandbox_listener_matches_runtime(
+    port: u16,
+    runtime: &ScienceRuntimeIdentity,
+) -> bool {
+    listener_uses_runtime(port, runtime)
 }
 
 /// Stop the sandbox Science process and clear the in-memory sandbox URL.
@@ -618,9 +797,11 @@ mod tests {
     use super::{
         classify_known_runtime_state, classify_sandbox_state, first_http_url, runtime_status_value,
         sandbox_home, sandbox_running_ours, sandbox_url, science_runtime_preflight_for_paths,
-        science_status_running, select_science_runtime_for_paths, settings_change_needs_teardown,
-        stop_runtime_from_probe, trusted_science_status, SandboxScienceState,
-        ScienceRuntimeIdentity, ScienceRuntimeSource, CACHED_ONCE_CHOICE,
+        science_runtime_preflight_for_paths_cached, science_status_running,
+        select_science_runtime_for_paths, select_science_runtime_for_paths_cached,
+        settings_change_needs_teardown, stop_runtime_from_probe, trusted_science_status,
+        SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource, ScienceVersionCache,
+        CACHED_ONCE_CHOICE,
     };
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
@@ -667,6 +848,43 @@ mod tests {
             first_http_url("http://127.0.0.1:8990").as_deref(),
             Some("http://127.0.0.1:8990")
         );
+    }
+
+    #[test]
+    fn version_cache_is_shared_and_invalidates_when_binary_changes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_temp_dir("science-version-cache")?;
+        let app_bin = root.join("claude-science");
+        let count = root.join("version-count");
+        write_counted_version_bin(&app_bin, &count, "claude-science cache-v1")?;
+        let data_dir = root.join("data");
+        fs::create_dir_all(&data_dir)?;
+        let cache = ScienceVersionCache::default();
+
+        let preflight =
+            science_runtime_preflight_for_paths_cached(&data_dir, None, &app_bin, &cache)?;
+        assert_eq!(preflight["selected_version"], "claude-science cache-v1");
+        let selected =
+            select_science_runtime_for_paths_cached(&data_dir, None, &app_bin, None, &cache)?;
+        assert_eq!(selected.version.as_deref(), Some("claude-science cache-v1"));
+        assert_eq!(fs::read_to_string(&count)?, "1");
+
+        write_counted_version_bin(&app_bin, &count, "claude-science cache-version-two")?;
+        let selected =
+            select_science_runtime_for_paths_cached(&data_dir, None, &app_bin, None, &cache)?;
+        assert_eq!(
+            selected.version.as_deref(),
+            Some("claude-science cache-version-two")
+        );
+        assert_eq!(fs::read_to_string(&count)?, "2");
+
+        assert_eq!(
+            cache.force_refresh(&app_bin).as_deref(),
+            Some("claude-science cache-version-two")
+        );
+        assert_eq!(fs::read_to_string(&count)?, "3");
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
@@ -1023,5 +1241,25 @@ mod tests {
             ),
         )?;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+
+    fn write_counted_version_bin(
+        path: &std::path::Path,
+        count: &std::path::Path,
+        version: &str,
+    ) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = \"--version\" ]; then count=$(cat '{}' 2>/dev/null || echo 0); count=$((count + 1)); printf '%s' \"$count\" > '{}'; printf '%s\\n' '{}'; exit 0; fi\nexit 0\n",
+                count.display(),
+                count.display(),
+                version
+            ),
+        )?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
     }
 }

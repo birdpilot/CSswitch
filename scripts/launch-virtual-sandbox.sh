@@ -115,10 +115,11 @@ if ! is_safe_science_bin "$BIN"; then
   echo "拒绝：Science binary 必须是无符号链接的绝对可执行文件"
   exit 1
 fi
-if ! HOME="$SANDBOX_HOME" "$BIN" --version >/dev/null 2>&1; then
+if [[ "${CSSWITCH_RUNTIME_VERSION_PRECHECKED:-0}" != "1" ]] && ! HOME="$SANDBOX_HOME" "$BIN" --version >/dev/null 2>&1; then
   echo "拒绝：Science binary 未通过非写入版本预检"
   exit 1
 fi
+unset CSSWITCH_RUNTIME_VERSION_PRECHECKED
 
 if /usr/sbin/lsof -nP -iTCP:"$PREVIEW_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
   echo "拒绝：隔离预览端口 $PREVIEW_PORT 已被占用"

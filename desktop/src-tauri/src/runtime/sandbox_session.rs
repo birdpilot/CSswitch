@@ -12,12 +12,14 @@ use crate::runtime::proxy_lifecycle::{
     current_skill_install_bridge_key, ensure_proxy, skill_install_bridge_dir,
 };
 use crate::runtime::science::{
-    probe_known_runtime, probe_sandbox_runtime, sandbox_home, sandbox_running_ours, sandbox_url,
-    select_science_runtime, stop_sandbox, SandboxScienceState, ScienceRuntimeIdentity,
+    probe_known_runtime, probe_sandbox_runtime_cached, sandbox_data_dir, sandbox_home,
+    sandbox_listener_matches_runtime, sandbox_url, select_science_runtime_cached, stop_sandbox,
+    SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource,
 };
 use crate::runtime::skill_install_bridge::{
-    attach_route_after_science_start, inspect_while_science_running, register_before_science_start,
-    RegistrationStatus,
+    configure_third_party_after_science_start, inspect_while_science_running,
+    invalidate_route_configuration, mark_route_configuration_current,
+    register_before_science_start, route_configuration_is_current, RegistrationStatus,
 };
 use crate::runtime::system::{asset_root, log_path, open_in_browser, open_log, redact, tail_file};
 use crate::{config, lifecycle, lock, oauth_forge, proc, AppState, SharedAppState};
@@ -29,6 +31,7 @@ fn stop_sandbox_state<R: Runtime>(
     let runtime = st.science_runtime.clone();
     let result = stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, runtime.as_ref());
     if result.is_ok() {
+        st.science_confirmed_stopped = runtime;
         st.science_runtime = None;
     }
     result
@@ -83,20 +86,143 @@ fn append_installer_note(mut message: String, status: &RegistrationStatus) -> St
     message
 }
 
-fn attach_route_best_effort<R: Runtime>(
+fn configure_third_party_best_effort<R: Runtime>(
     app: &tauri::AppHandle<R>,
     status: RegistrationStatus,
-    control_url: &str,
+    data_dir: &std::path::Path,
+    port: u16,
+    runtime: &ScienceRuntimeIdentity,
+    force: bool,
 ) -> RegistrationStatus {
     if !matches!(
         status,
         RegistrationStatus::Registered | RegistrationStatus::AlreadyRegistered
     ) {
+        let _ = invalidate_route_configuration(data_dir);
         return status;
     }
-    match attach_route_after_science_start(app, control_url) {
+    let Some(science_version) = runtime.version.as_deref() else {
+        let _ = invalidate_route_configuration(data_dir);
+        return RegistrationStatus::Warning(
+            "Science 版本无法确认，未记录第三方能力配置状态".into(),
+        );
+    };
+    let needs_configuration = force
+        || matches!(status, RegistrationStatus::Registered)
+        || match route_configuration_is_current(data_dir, science_version) {
+            Ok(current) => !current,
+            Err(error) => return RegistrationStatus::Warning(error),
+        };
+    if !needs_configuration {
+        return status;
+    }
+    if let Err(error) = invalidate_route_configuration(data_dir) {
+        return RegistrationStatus::Warning(error);
+    }
+    let control_url = sandbox_url(port, runtime);
+    if let Err(error) = configure_third_party_after_science_start(app, &control_url) {
+        return RegistrationStatus::Warning(error);
+    }
+    match mark_route_configuration_current(data_dir, science_version) {
         Ok(()) => status,
         Err(error) => RegistrationStatus::Warning(error),
+    }
+}
+
+/// Explicit doctor action: bypass the version cache and route marker without
+/// starting Science or the proxy solely for diagnostics.
+pub(crate) fn force_third_party_reconcile<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &SharedAppState,
+) -> Result<String, String> {
+    let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+    let data_dir = sandbox_data_dir();
+    let (remembered_runtime, version_cache) = {
+        let st = lock(state);
+        (st.science_runtime.clone(), st.science_version_cache.clone())
+    };
+
+    let (science_state, running_runtime) = match remembered_runtime {
+        Some(mut runtime) => {
+            let previous_version = runtime.version.clone();
+            let refreshed = version_cache
+                .force_refresh(&runtime.path)
+                .ok_or("Science 版本强制复检失败")?;
+            if previous_version
+                .as_deref()
+                .is_some_and(|version| version != refreshed)
+            {
+                invalidate_route_configuration(&data_dir)?;
+                return Ok(
+                    "Science 二进制版本已变化；已安排下次停止并启动后重新配置 Skill 路由。".into(),
+                );
+            }
+            runtime.version = Some(refreshed);
+            let science_state = probe_known_runtime(cfg.sandbox_port, &runtime);
+            let running = (science_state == SandboxScienceState::RunningHealthy).then_some(runtime);
+            (science_state, running)
+        }
+        None => {
+            version_cache.clear();
+            probe_sandbox_runtime_cached(cfg.sandbox_port, &version_cache)?
+        }
+    };
+
+    if cfg.mode == "official" {
+        return Ok("官方模式无需核验 CSSwitch 第三方 Skill 路由。".into());
+    }
+    match science_state {
+        SandboxScienceState::Stopped => {
+            invalidate_route_configuration(&data_dir)?;
+            Ok("Science 未运行；已安排下次一键开始重新核验 Skill 路由。".into())
+        }
+        SandboxScienceState::Unknown => {
+            invalidate_route_configuration(&data_dir)?;
+            Err("无法确认 Science 实例身份；已使路由标记失效，未执行修复".into())
+        }
+        SandboxScienceState::RunningHealthy => {
+            let runtime = running_runtime.ok_or("Science 运行身份缺失")?;
+            let secret = { lock(state).secret.clone() };
+            if secret.is_empty() {
+                invalidate_route_configuration(&data_dir)?;
+                return Ok("当前代理身份不可用；已安排下次一键开始重新核验 Skill 路由。".into());
+            }
+            let bridge_dir = skill_install_bridge_dir(&secret)?;
+            let bridge_key = match current_skill_install_bridge_key() {
+                Ok(path) => path,
+                Err(error) => {
+                    invalidate_route_configuration(&data_dir)?;
+                    return Ok(format!(
+                        "Skill bridge 尚未就绪；已安排下次一键开始重新核验：{error}"
+                    ));
+                }
+            };
+            let status = inspect_while_science_running(app, &data_dir, &bridge_dir, &bridge_key);
+            let status = configure_third_party_best_effort(
+                app,
+                status,
+                &data_dir,
+                cfg.sandbox_port,
+                &runtime,
+                true,
+            );
+            {
+                let mut st = lock(state);
+                st.science_runtime = Some(runtime);
+                st.science_confirmed_stopped = None;
+            }
+            match status {
+                RegistrationStatus::AlreadyRegistered | RegistrationStatus::Registered => {
+                    Ok("Skill 路由已强制核验并同步。".into())
+                }
+                RegistrationStatus::RestartRequired => {
+                    Ok("Skill 路由文件需要重启 Science 后加载；状态标记已失效。".into())
+                }
+                RegistrationStatus::Warning(message) => {
+                    Ok(format!("Skill 路由核验未完成：{message}"))
+                }
+            }
+        }
     }
 }
 
@@ -117,8 +243,15 @@ pub(crate) fn one_click_login<R: Runtime>(
 
     let sbx_home = sandbox_home();
     let auth_dir = sbx_home.join(".claude-science");
+    let version_cache = { lock(&state).science_version_cache.clone() };
 
-    let remembered_runtime = { lock(&state).science_runtime.clone() };
+    let (remembered_runtime, confirmed_stopped) = {
+        let mut st = lock(&state);
+        (
+            st.science_runtime.clone(),
+            st.science_confirmed_stopped.take(),
+        )
+    };
     let (science_state, running_runtime) = match remembered_runtime {
         Some(runtime) => {
             let science_state = probe_known_runtime(sport, &runtime);
@@ -126,7 +259,14 @@ pub(crate) fn one_click_login<R: Runtime>(
                 (science_state == SandboxScienceState::RunningHealthy).then_some(runtime);
             (science_state, running_runtime)
         }
-        None => probe_sandbox_runtime(sport)?,
+        None if confirmed_stopped
+            .as_ref()
+            .is_some_and(|runtime| runtime.source != ScienceRuntimeSource::CachedOnce)
+            && !proc::loopback_port_in_use(sport, 100) =>
+        {
+            (SandboxScienceState::Stopped, None)
+        }
+        None => probe_sandbox_runtime_cached(sport, &version_cache)?,
     };
     let launch_runtime: ScienceRuntimeIdentity = match science_state {
         SandboxScienceState::RunningHealthy => {
@@ -146,16 +286,21 @@ pub(crate) fn one_click_login<R: Runtime>(
                     ),
                     Err(error) => RegistrationStatus::Warning(error),
                 };
-                // Consume a dedicated one-time URL for control-plane attachment;
-                // the browser receives a fresh URL below.
-                let control_url = sandbox_url(sport, &running_runtime);
-                let installer = attach_route_best_effort(&app, installer, &control_url);
+                let installer = configure_third_party_best_effort(
+                    &app,
+                    installer,
+                    &auth_dir,
+                    sport,
+                    &running_runtime,
+                    false,
+                );
                 let url = sandbox_url(sport, &running_runtime);
                 {
                     let mut st = lock(&state);
                     st.sandbox_port = sport;
                     st.sandbox_url = Some(url.clone());
                     st.science_runtime = Some(running_runtime.clone());
+                    st.science_confirmed_stopped = None;
                 }
                 let base = match proxy_action {
                     ProxyAction::Reused => "已在运行",
@@ -187,9 +332,11 @@ pub(crate) fn one_click_login<R: Runtime>(
                     ));
                 }
             }
-            select_science_runtime(runtime_choice)?
+            select_science_runtime_cached(runtime_choice, &version_cache)?
         }
-        SandboxScienceState::Stopped => select_science_runtime(runtime_choice)?,
+        SandboxScienceState::Stopped => {
+            select_science_runtime_cached(runtime_choice, &version_cache)?
+        }
         SandboxScienceState::Unknown => {
             trace.finish("error=sandbox_state_unknown_before_start");
             return Err(format!(
@@ -207,6 +354,7 @@ pub(crate) fn one_click_login<R: Runtime>(
             "隔离 Science 预览端口 {preview_port} 已被占用；未启动或结束任何占用者。请修改沙箱端口后重试。"
         ));
     }
+    lock(&state).science_confirmed_stopped = None;
 
     trace.stage(OperationStage::SandboxLogin, "ensure_virtual_login");
     let (forged, login_action) =
@@ -259,6 +407,7 @@ pub(crate) fn one_click_login<R: Runtime>(
         .arg("--skip-oauth-forge")
         .env("SANDBOX_HOME", sandbox_home())
         .env("SCIENCE_BIN", &launch_runtime.path)
+        .env("CSSWITCH_RUNTIME_VERSION_PRECHECKED", "1")
         .env("CSSWITCH_PROXY_URL", &proxy_url)
         .env(
             "CSSWITCH_REUSE_SYSTEM_SSH",
@@ -289,6 +438,7 @@ pub(crate) fn one_click_login<R: Runtime>(
         let mut st = lock(&state);
         st.sandbox_port = sport;
         st.science_runtime = Some(launch_runtime.clone());
+        st.science_confirmed_stopped = None;
     }
 
     let mut ok = false;
@@ -315,7 +465,7 @@ pub(crate) fn one_click_login<R: Runtime>(
         ));
     }
 
-    if !sandbox_running_ours(sport, &launch_runtime) {
+    if !sandbox_listener_matches_runtime(sport, &launch_runtime) {
         {
             let mut st = lock(&state);
             let _ = stop_sandbox_state(&app, &mut st);
@@ -326,16 +476,23 @@ pub(crate) fn one_click_login<R: Runtime>(
         ));
     }
 
-    // Route attachment is best-effort and cannot fail Science startup. Use a
-    // dedicated one-time URL so the UI URL remains valid for the user.
-    let control_url = sandbox_url(sport, &launch_runtime);
-    let installer = attach_route_best_effort(&app, installer, &control_url);
+    // Third-party policy setup is best-effort. A dedicated control URL is only
+    // consumed when the persisted route state says reconciliation is required.
+    let installer = configure_third_party_best_effort(
+        &app,
+        installer,
+        &auth_dir,
+        sport,
+        &launch_runtime,
+        false,
+    );
     let url = sandbox_url(sport, &launch_runtime);
     {
         let mut st = lock(&state);
         st.sandbox_port = sport;
         st.sandbox_url = Some(url.clone());
         st.science_runtime = Some(launch_runtime.clone());
+        st.science_confirmed_stopped = None;
     }
     let started = match login_action {
         oauth_forge::LoginAction::Created => "已启动",
