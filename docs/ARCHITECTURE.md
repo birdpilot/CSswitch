@@ -6,7 +6,7 @@ This file is the current architecture contract. Release notes and dated investig
 
 CSSwitch is a provider switcher and launcher for Claude Science. It converts a selected provider profile into the Anthropic-compatible local endpoint Science expects, manages the CSSwitch Gateway, prepares the isolated local login state, and starts or reopens Science.
 
-Science owns its product capabilities and data: projects, organizations, native Skills, Add Skill / GitHub import, runtime resources, and upgrades. CSSwitch must not make those features startup prerequisites. In the currently verified Science build, supported external-Skill authoring/import/delete paths query the Anthropic account catalog and may fail in CSSwitch third-party mode. Version 0.5.0 does not emulate that catalog; it adds only a user-approved public-GitHub directory bridge. One fixed routing Skill directs install and uninstall requests to a combined local MCP connector, Science owns host-access approval and Agent-Skill `attach_skill`/`detach_skill`, and the existing CSSwitch gateway performs the bounded atomic copy or quarantines its own imports. CSSwitch attaches only that fixed route through Science's loopback one-time-nonce/CSRF UI control plane; it exposes no general control client and adds no Skill Manager, catalog, inventory, or lifecycle gate.
+Science owns its product capabilities and data: projects, organizations, native Skills, runtime resources, and upgrades. CSSwitch must not make those features startup prerequisites. In the currently verified Science build, built-in Add Skill / GitHub import paths may query the Anthropic account catalog and fail in third-party mode. CSSwitch does not emulate that catalog. Its external-Skill bridge accepts a public GitHub repository/collection/Skill URL or a host-selected local ZIP. The CSSwitch host downloads one archive, validates it, atomically commits either one Skill or one Nature-like Skill collection, and binds `OPERON` through a bounded loopback nonce/CSRF control plane. Bundle support preserves sibling Skills and support paths such as `_shared`; it does not install Plugin hooks, MCP, agents, or external runtime dependencies. The design does not enable Skill Manager, store, inventory, catalog, or SQLite.
 
 ## Runtime flow
 
@@ -32,9 +32,9 @@ The one-click path must not pass through an external Skill directory, CSSwitch S
 | Version-specific runtime resources | `<data-dir>/runtime/<version>/` | Science internal implementation |
 | Native and imported Skills | `<data-dir>/orgs/<active-org>/skills/<name>/` | Science organization |
 | Provider capability metadata | `catalog/capabilities.v1.json` | CSSwitch |
-| Legacy Skill store/inventory from 0.4.2/0.4.3 | retained but unused | Neither runtime path |
+| Dormant Skill Manager/store/inventory source | retained but unused | Neither runtime path |
 
-CSSwitch reuses the persistent Science data-dir across launches and Science upgrades. The normal launch path does not rebuild that directory, synchronize it in either direction, or delete user changes. The 0.5.0 conversation bridge may atomically ensure its exact fixed route, may copy one explicitly requested public Skill into the active organization, and may atomically quarantine only a directory carrying its own valid user-import marker. Same-name user or modified route content is never overwritten.
+CSSwitch reuses the persistent Science data-dir across launches and Science upgrades. The normal launch path does not rebuild that directory, synchronize it in either direction, or delete user changes. The external-Skill bridge may atomically ensure its exact fixed route, install one explicitly requested package into the active organization, bind it to `OPERON`, and quarantine only content carrying a valid CSSwitch marker. Bundle ownership and path hashes live under `sandbox/skill-bundles/<org>/`; they are not Science database records. Same-name foreign content or a changed installed payload is never overwritten.
 
 The App executable, persistent data-dir, version-specific runtime resources, and organization Skill directories are different facts. The data-dir provides state continuity; it is not an executable-version pin. CSSwitch normally selects the currently installed Claude Science App. A valid absolute non-symlink `SCIENCE_BIN` remains an explicit development override and fails closed when invalid.
 
@@ -52,7 +52,7 @@ The CSSwitch Gateway binds loopback, and isolated Science is launched with an ex
 
 System SSH configuration reuse is a separate opt-in compatibility bridge for Science's native SSH functionality. When disabled, isolated Science does not see the real SSH config. When enabled, CSSwitch prepends a narrow `ssh` wrapper that invokes `/usr/bin/ssh -F <real-home>/.ssh/config`; it does not copy or link `.ssh`, expose private-key content to the UI, start `sshd`, enable Remote Login, change the firewall, or open a public listener. This grant is behavioral rather than file-count based: OpenSSH `Include`, `IdentityFile`, `IdentityAgent`, `ProxyCommand`, and `Match exec` rules can reach other files or commands under their normal semantics.
 
-The local Rust backend obtains separate one-time Science URLs for bounded control-plane reconciliation and browser opening, keeps them in backend memory, and never serializes them into Tauri status. Closing the settings window only hides it and keeps the managed local chain running. Explicitly quitting CSSwitch stops the isolated Science daemon before the Gateway.
+The local Rust backend obtains fresh one-time Science URLs for route reconciliation, Skill control preflight, each attach, and browser opening. It keeps them in backend memory and never serializes them into Tauri status. Attach subprocesses run with a cleared environment and a verified Science binary fingerprint. Closing the settings window only hides it and keeps the managed local chain running. Explicitly quitting CSSwitch stops the isolated Science daemon before the Gateway.
 
 ## Failure boundary
 
@@ -60,4 +60,4 @@ Provider configuration, Gateway startup, isolated-login preparation, runtime pre
 
 Science version discovery is fail-open with respect to an existing healthy daemon. A missing or non-runnable official App candidate makes a readable retained sandbox binary eligible for explicit one-launch authorization; it is never selected implicitly. Once a newer binary has actually attempted to open the persistent data-dir, CSSwitch must not blindly start an older binary against a potentially migrated directory.
 
-The Skill Manager source remains recoverable from the `v0.4.3` tag and protected development worktrees, but it is not compiled, registered, packaged, or executed in the focused runtime.
+The Skill Manager source remains in the repository for possible future work, but the two supported installation entries do not call its store, inventory, deployment, catalog, or database modules.

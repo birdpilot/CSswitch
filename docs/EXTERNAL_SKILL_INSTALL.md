@@ -1,125 +1,150 @@
-# External Skill install bridge (0.5.0)
+# 外部 Skill 安装桥（v0.6.0）
 
-This is a narrow bridge for a missing third-party-mode workflow. It is not a Skill Manager.
+CSSwitch 只提供两个窄入口，不启用 Skill Manager：
 
-## User behavior
+1. Science Agent 调用 `install_external_skill`，参数是公开 GitHub 仓库、Plugin/Skill 集合或准确 Skill 目录 URL。
+2. CSSwitch 主面板通过系统文件选择器导入本地 `.zip` 或 `.skill`。
 
-The primary Science request is:
+两条路线都由 CSSwitch 宿主执行下载或读取、包校验、原子提交和 `OPERON` 绑定。它们不调用 Anthropic Skill catalog，不读取 Science/GitHub credential，不写 SQLite、inventory、store 或 catalog。
+
+## 正式数据流
+
+### GitHub URL
 
 ```text
-请安装这个外部 Skill：
-https://github.com/owner/repo/tree/ref/path
+用户给 Agent 准确 URL
+  -> Agent 调 install_external_skill(source_url)
+  -> 签名 bridge request
+  -> CSSwitch Gateway 验证 Science host context
+  -> 匿名解析 commit（named ref 最多一次 API）
+  -> 对固定 commit 只发起一次 archive 请求，不自动重试
+  -> 只接受受信 https://codeload.github.com 302
+  -> archive 长连接无法安全完成时，回退到同一固定 commit 的 tree/raw 文件级下载
+  -> fallback 仍属于同一 bridge request，校验 tree 完整性并报告文件数/字节进度，不生成新请求
+  -> 单 Skill 旧入口 90 秒、archive bundle 30 分钟总时限，慢速分块不能无限刷新 deadline
+  -> bridge 写入 <id>.status.json：source_resolution / recovery / download / validation / commit / attach
+  -> status 含 2 秒心跳、elapsed_seconds、31 分钟宿主响应 deadline；Agent 只轮询同一 ID，禁止重复提交
+  -> 识别单 Skill 或唯一 Nature-like Skill 集合
+  -> 校验并原子提交单目录或完整集合根
+  -> 获取新的 Science nonce URL
+  -> nonce / cookie / CSRF / OPERON 单个或批量绑定 / GET 回读
+  -> 单 Skill 由 Agent 调 skill(skill_name)；bundle 以批量回读为验收
 ```
 
-Science first loads the attached `csswitch-external-skill-tools` routing Skill. It directs the Agent to the generated `mcp-csswitch-skill-installer` connector Skill, which exposes `install_external_skill` and `uninstall_external_skill`. After the normal MCP confirmation, the Agent requests read-write access to a dedicated `~/CSSwitch-Skill-Bridge-*` directory, submits a one-time request, and reads the response.
+Agent 不下载文件、不用 shell 或 Python 文件 API、不提供 staged package、不调用 catalog/Skill Manager，也不手工调用 `host.agents.attach_skill`。当返回 `FILES_COMMITTED_ATTACH_REQUIRED` 或 `ATTACH_STATE_UNCERTAIN` 时，Agent 使用相同 URL 重试安装工具；CSSwitch 重新验证已提交内容并重试 attach。
 
-File copy is not reported as a usable installation. A successful copy returns `FILES_COMMITTED_ATTACH_REQUIRED` with the exact Skill name. The Agent must then call:
+`HOST_ACCESS_REQUIRED` 返回 request/status/response 三个文件名和 `poll_external_skill_request`。Agent 只写一次 request，之后只用同一 request ID 调只读 poll 工具；第一次省略 `last_sequence`，后续传回上一轮 sequence。gateway 内部长轮询最多 10 秒，阶段改变或最终 response 出现即返回，Agent 不再反复读文件，也禁止用独立 `sleep` 或长时间 shell/Python 循环等待。下载核心的总 deadline 是 30 分钟，bridge 另留 60 秒给校验、提交、绑定和最终响应。超过宿主 deadline 与 5 秒 grace 仍无 response 时 poll 工具返回 `HOST_RESPONSE_TIMEOUT`，仍不得重提。宿主以不可覆盖方式原子写最终 response，随后删除 `.processing` 和 status。成功、结构化失败及 `GITHUB_TIMEOUT` 走同一收口；gateway 重启会把遗留 `.processing` 转为 `REQUEST_INTERRUPTED` 最终响应并要求通过新请求做幂等状态恢复。
 
-```python
-host.agents.attach_skill("OPERON", skill_name)
+### 本地包
+
+主面板的“导入 Skill 包”调用无路径参数的 `install_local_skill_package()`。Rust 后端打开系统 picker，只显示 `.zip/.skill`；前端从不接收或提交本地路径。
+
+选择前和选择后都要求：
+
+- Science 是 `RunningHealthy`；
+- binary canonical path、版本和文件指纹仍匹配；
+- 隔离 HOME、data-dir 和 sandbox port 未变化；
+- 新的一次性 nonce、认证 cookie、CSRF 和 OPERON 回读可用。
+
+后端使用 `O_NOFOLLOW` 打开普通文件，并从同一个 file descriptor 计算 archive SHA-256 和解压。UI 自动识别单 Skill 或 bundle；bundle 成功显示安装数量和名称摘要，不要求逐个 `skill()` 验证。
+
+## GitHub v1 范围
+
+接受：
+
+```text
+https://github.com/<owner>/<repo>/tree/<ref>/<path...>
+https://github.com/<owner>/<repo>/tree/<ref>
+https://github.com/<owner>/<repo>
 ```
 
-and load `skill_name` with `skill()` before reporting it usable. This uses Science's native Agent-Skill binding and registry refresh rather than writing the Science database or calling a private HTTP endpoint.
+`ref` 是单个 URL segment 的 branch/tag 或 40 位 commit SHA。40 位 SHA 不请求 commit API，仓库根使用一次 `commits/HEAD`。私有仓库、token、带 `/` 的 branch/tag、内部 symlink 物化、外部 marketplace source 和完整 Plugin runtime 不在 v1 范围。
 
-If the user supplies only a name, the MCP tool returns `NEED_SOURCE_URL` without writing files. The Agent may use its normal search capability to find candidate public repositories, but it must not install an ambiguous guess. The bridge itself never searches for or guesses a repository and always requires an exact URL.
+bundle 集合根必须有直接包含 `SKILL.md` 的成员目录。集合根内所有普通文件按原相对路径映射到 Science `skills/` 根，因此 `_shared`、兄弟 Skill 和支持资源会被保留；只绑定直接成员。多个候选不猜测。`${CLAUDE_PLUGIN_ROOT}`、hooks、MCP 或 agents runtime 返回 `UNSUPPORTED_PLUGIN_RUNTIME_DEPENDENCY`。
 
-For removal, the routing Skill directs Science to the same connector's `uninstall_external_skill` tool. It accepts an exact Skill name only when the directory carries a valid CSSwitch `.import-origin`, moves the complete directory to `~/.csswitch/sandbox/skill-trash/`, and returns `QUARANTINED_DETACH_REQUIRED`. The Agent must then call:
+公开仓库使用匿名请求；Gateway 不读取 `GITHUB_TOKEN`、`GH_TOKEN` 或 `.netrc`。403/429 根据 rate-limit header 区分 `GITHUB_RATE_LIMITED`，权限、404、tree 截断、网络失败和总时限超时分别返回结构化错误。
 
-```python
-host.agents.detach_skill("OPERON", skill_name)
+## Package 安全边界
+
+共享 crate 是 `desktop/skill-package`（包名 `csswitch-skill-install-core`），被 Gateway 和 Tauri 通过 path dependency 复用。固定限制：
+
+| 项目 | 上限 |
+| --- | ---: |
+| archive 原始大小 | 128 MiB |
+| archive entries | 10,000 |
+| Skill 文件数 | 512 |
+| 单文件 | 4 MiB |
+| Skill 总解压大小 | 32 MiB |
+| bundle 文件数 | 2,000 |
+| bundle 总解压大小 | 64 MiB |
+| 路径 | 1,024 bytes |
+| 路径深度 | 32 |
+
+路径必须是 UTF-8 和 Unicode NFC。绝对路径、`..`、反斜杠、NUL、重复路径、父文件冲突、大小写/NFC 冲突、符号链接和特殊文件都会被拒绝。`__MACOSX/**` 与 `.DS_Store` 被忽略；来源自带 `.import-origin` 或 `.catalog_stamp` 会被拒绝。
+
+GitHub `100755` 或 ZIP 明确 Unix executable bit 的文件落为 `0700`，其它文件为 `0600`，目录为 `0700`。不根据 shebang 推断权限。
+
+`content_sha256` 对按路径排序后的长度前缀路径、executable bit、长度前缀内容计算；不包含 marker 和 Finder metadata。`_shared` 扫描只检查 `SKILL.md` 中的 Markdown/前置 YAML 路径以及脚本中的引号路径字面量，结果固定标记 `BEST_EFFORT`。
+
+## Marker 与恢复
+
+所有新安装写 Science 兼容的 version 1 `.import-origin`：
+
+- 保留 `repo`、40 位小写 `sha`、`plugin`、`marketplace: csswitch-local-bridge`、`path`、`importedAt`、`license`；
+- 扩展字段是 `csswitch_revision: 2`、`source_kind` 和完整 `content_sha256`；
+- 本地包另写完整 `archive_sha256`，外层 `sha` 是其前 40 位，`repo` 是 `csswitch/local-archive`。
+- bundle 每个成员另写 `bundle_id`、`bundle_name`、`bundle_content_sha256` 和 `bundle_member_path`；支持目录不伪装成 Skill。
+
+bundle manifest 和持久 transaction journal 位于 `sandbox/skill-bundles/<org>/`。提交前锁定全部新旧顶层路径；同来源更新必须先通过完整 path hash 校验，失败会回滚或在下次同 bundle 操作恢复。
+
+从任意 bundle 成员发起卸载时，第一次请求只返回
+`BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED`，其中包含 `bundle_id`、`bundle_name`、
+完整 `affected_skill_names`、`confirmation_scope: whole_bundle` 以及
+`partial_uninstall_supported: false`。该响应不 detach、不移动文件，也不写
+quarantine。用户取消时 Agent 不再调用工具；用户明确确认后，第二次请求必须
+同时提交原 `skill_name` 和响应中的精确 `confirm_bundle_id`。Gateway 会重新查找并
+校验 manifest 和所有成员；ID 或归属变化时重新返回确认，不沿用旧确认。只有匹配
+确认才批量 detach 并整包 quarantine，不提供成员级物理删除。
+
+同名目录无有效 marker 或来源不同返回 `SKILL_NAME_CONFLICT`。marker 匹配但内容摘要变化返回 `INSTALLED_CONTENT_CHANGED`，不覆盖。新 marker 内容一致时直接重试 attach。
+
+旧 GitHub marker 缺少 `content_sha256` 时，只有重新下载固定 commit/path 且内容完全一致才原子升级 marker。无法下载或不一致时不自动 attach。
+
+## Science attach control
+
+Tauri 传给 Gateway 的 `ScienceHostContext` 包含 canonical binary path、版本、`dev/inode/size/mtime/mode` 指纹、隔离 HOME、data-dir 和 sandbox port。它参与 Gateway 复用指纹；runtime 或 context 变化会重启 Gateway。手工只启动代理且没有确认 Science 时，代理照常运行，但安装返回 `SCIENCE_NOT_READY` 且不写文件。
+
+每次 control preflight 和 attach 都重新执行绝对路径的：
+
+```text
+claude-science url --data-dir <isolated-data-dir>
 ```
 
-and verify that `skill()` no longer loads it. It must not fall back to catalog-gated `host.skills.delete` or `skills.deleteDraft`.
+子进程使用 `env_clear()`，只恢复受控 `HOME`、`TMPDIR` 和 locale；provider/GitHub credential 不会继承。只接受退出码 0、64 KiB 内唯一 loopback URL、预期端口和唯一合法 nonce。上限 10 秒，超时杀整个进程组并 `wait`。
 
-## Why a routing Skill is required
+单 Skill attach 使用原 POST；bundle 使用一次 `PUT /api/agents/OPERON/skills` 提交 `attach`/`detach` 数组。两者都必须 GET 回读。请求结果不确定或 active org 在请求后变化返回 `ATTACH_STATE_UNCERTAIN`，已提交目录保留。
 
-MCP connection alone did not make natural-language selection deterministic. A real UI conversation asking to remove an imported Skill repeatedly selected bundled `customize`, called catalog-gated `host.skills.delete`, then attempted manual deletion in the wrong visible `~/.claude-science` directory. Connector descriptions and auto-attachment were insufficient.
+## 结果状态
 
-The current design therefore installs one tiny standard Skill, `csswitch-external-skill-tools`, and attaches it to the default `OPERON` Agent. It contains routing instructions only: install and uninstall must use the matching tool on the CSSwitch connector, never `customize`, `host.skills.*`, shell deletion, or filesystem probing. The route is written atomically with a `csswitch-system-bridge` ownership marker. Existing same-name user or modified content is never overwritten. The route itself is not removable through the external-Skill uninstaller because its marker is not a user import.
+所有结构化安装响应包含 `schema_version: 2`。主要状态：
 
-After Science is healthy, CSSwitch obtains a dedicated one-time URL from the official `claude-science url --data-dir ...` command and uses the same local nonce/cookie/CSRF flow as the Science UI to attach this fixed route to `OPERON`. The gateway subcommand accepts only loopback HTTP, a valid one-time nonce, the fixed Agent, and the fixed route name. The nonce is passed through the child environment rather than argv, and a fresh one-time URL is generated for the browser afterward. There is no OAuth emulation, private bearer token, or database write. This bounded UI control-plane contract is an upstream compatibility risk and is covered by focused tests.
+- `INSTALLED_ATTACHED_VERIFY_REQUIRED`：文件和 OPERON 绑定已确认，仍需 Agent 调 `skill()`；
+- `BUNDLE_INSTALLED_ATTACHED`：整个集合和批量 OPERON 绑定已回读确认；
+- `BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED`：只返回整包确认和完整受影响列表，文件与绑定尚未改动；
+- `BUNDLE_UNINSTALLED_DETACHED`：从任意成员触发的整包卸载、批量 detach 和 quarantine 已确认；
+- `FILES_COMMITTED_ATTACH_REQUIRED`：文件保留，attach 未完成，可用同一输入重试；
+- `ATTACH_STATE_UNCERTAIN`：attach 请求结果或 org 状态无法确定，可重试；
+- `SCIENCE_NOT_READY`：没有可验证 control plane，不写入新安装；
+- `CANCELLED`：用户取消 picker；
+- `SKILL_NAME_CONFLICT`、`INSTALLED_CONTENT_CHANGED`、`UNSUPPORTED_SHARED_DEPENDENCY`：失败且不覆盖。
+- `MULTIPLE_BUNDLE_CANDIDATES`、`BUNDLE_STRUCTURE_UNSUPPORTED`、`BUNDLE_LIMIT_EXCEEDED`、`BUNDLE_PATH_CONFLICT`、`UNSUPPORTED_PLUGIN_RUNTIME_DEPENDENCY`：bundle 失败且不部分提交。
 
-## Data flow and trust boundary
+兼容字段在一个版本内保留。ZIP 返回 `source_digest_sha256`，GitHub 返回 `resolved_commit_sha`。
 
-1. CSSwitch starts its normal authenticated local gateway and creates a mode-0700 bridge directory derived from the existing persistent CSSwitch secret. A separate mode-0600 bridge signing key is derived from both that secret and the per-process Gateway launch identity, so restarting Gateway invalidates requests signed for the previous process.
-2. Before Science starts, CSSwitch atomically merges one managed stdio entry into `<data-dir>/mcp/local-mcp.json`. It exposes both install and uninstall tools; its environment contains only the path to the private key file, never the key value. CSSwitch removes only the obsolete uninstaller entry carrying its own management marker and also atomically ensures the fixed route Skill. Existing unrelated entries and unknown fields are preserved; malformed, same-name unmanaged, or modified route content fails soft.
-3. Science exposes the connector as an auto-generated connector Skill. MCP remains sandboxed and does not receive direct access to the Science organization directory.
-4. After health and identity checks, CSSwitch uses a dedicated one-time local Science URL to attach the fixed route Skill to `OPERON`; failure only degrades the external-Skill feature and never fails Science startup.
-5. A matching natural-language request loads the route, then the combined connector. The user grants the dedicated bridge directory through Science's `request_host_access` flow.
-6. For install, `edit_file` submits a bounded, HMAC-signed request containing a random ID and short expiry. The host accepts only a same-owner, non-symlink regular request file, rejects stale, modified, mismatched, or replayed requests, then re-reads `active-org.json`, resolves the GitHub ref/path, downloads the complete directory, validates limits and paths, writes a version-1 `.import-origin`, and atomically renames it into `orgs/<active-org>/skills/<skill-name>` without overwriting an existing directory.
-7. The Agent calls Science's native `host.agents.attach_skill`, then verifies the `skill()` result.
-8. For uninstall, the gateway validates the exact name and CSSwitch marker, then atomically moves the directory into quarantine. The Agent calls native `detach_skill`, then verifies it is no longer loadable.
+## 废止路线
 
-The connector does not bypass Science's sandbox. Direct MCP writes, MCP loopback access, Unix sockets, private bearer tokens, and direct database writes are not used. The separate startup-only route attachment uses Science's own loopback nonce/CSRF control plane with a fixed action.
+旧的 Science-side credential/staged-fetch 方案已经废止：Science 不使用自己的 GitHub credential 下载后再向 CSSwitch 交包。原因是该路线依赖 host grant、让沙箱和凭据边界变复杂，并且会重新引入 provider/登录态差异。正式路线始终是 Agent 只发起 MCP 调用，CSSwitch 宿主下载。
 
-## Confirmed facts
+## 明确不做
 
-Confirmed by focused tests:
-
-- one combined MCP schema with distinct install and uninstall tools, plus safe migration of the old managed uninstaller entry;
-- Chinese and English discovery descriptions;
-- name-only `NEED_SOURCE_URL` with no file write;
-- public GitHub URL/ref/path resolution and complete multi-file download;
-- traversal, symlink, redirect, file-count, per-file, total-size, duplicate-target, and atomic no-replace protections;
-- HMAC authentication, launch-bound key rotation, request expiry/replay rejection, and nonblocking rejection of symlink/FIFO bridge entries;
-- persistent per-Skill advisory locks that recover after a crash while still serializing concurrent install/uninstall requests;
-- Science-compatible version-1 `.import-origin` with CSSwitch-specific ownership and no `.catalog_stamp`;
-- quarantine uninstall, repeat-uninstall failure, and refusal to remove bundled, unmarked, hand-written, or foreign imported directories;
-- atomic route creation, idempotence, fixed ownership marker, and preservation of modified or user-owned same-name content;
-- fixed loopback-only nonce/CSRF route attachment with no nonce in argv and a fresh browser URL;
-- every registration or Skill failure remains non-fatal to one-click Science startup.
-- install, attach, load, restart, uninstall, and detach leave every `<data-dir>/runtime/<version>/` directory outside the write target; external Skill files are committed only under the active organization.
-
-Confirmed by the 2026-07-13 isolated real-Science E2E using a temporary HOME/data-dir, dynamic ports, fake security/key material, a local mock provider, and public `anthropics/skills/internal-comms`:
-
-- Science ran with account fetch 401 and `skillCatalog` degraded;
-- the conversation discovered and loaded `mcp-csswitch-skill-installer`;
-- the Agent used `host.mcp`, `request_host_access`, `edit_file`, and `read_file`, not `host.skills.edit/publish`;
-- content was fetched and the complete directory plus `.import-origin` was atomically committed;
-- `host.agents.attach_skill("OPERON", "internal-comms")` persisted the binding;
-- `skill("internal-comms")` returned imported Skill metadata and complete instructions in the current conversation;
-- after stopping and restarting Science with the same temporary data-dir, a new conversation loaded the same imported Skill again;
-- a later conversation containing only `请卸载 internal-comms` discovered and loaded `csswitch-external-skill-tools`, then loaded the same `mcp-csswitch-skill-installer` connector used for installation;
-- the Agent called `uninstall_external_skill`, the host quarantined the marked directory, native `detach_skill` removed the binding, and `skill("internal-comms")` no longer loaded;
-- the natural-language uninstall round did not call `host.skills.delete`, `skills.deleteDraft`, bash, or manual filesystem deletion;
-- no real OAuth token, API key, Keychain credential, SSH material, or real Science organization data was used.
-
-Still separate or awaiting UI verification:
-
-- final manual UI confirmation in the locally installed CSSwitch app after confirming that it launches the currently installed Science executable rather than a stale data-dir fallback;
-- a particular installed Skill's own scripts/assets and domain function execution;
-- provider-dependent behavior when an Agent searches from a name-only request;
-- recovery/restore UI for quarantined content.
-
-## `@` artifacts/outputs are not Skills
-
-Science renders `@` output references as artifact or attachment objects backed by an artifact version or file path. They add data to the current request. Skill mentions are represented separately as `type: skill` and go through the Skill registry.
-
-An artifact can carry a prompt document and may imitate a prompt-only Skill when the user explicitly attaches it. It does not register a Skill, attach it to `OPERON`, automatically load scripts/references, persist natural-language triggering, or bypass the catalog gate of Add Skill/ZIP import. It is useful for context reuse, not an alternative external-Skill installer.
-
-## Focused tests
-
-- Gateway Rust tests: URL parsing, ref resolution, download limits, path/symlink rejection, signed-request validation, FIFO rejection, stale-lock recovery, marker validation, atomic install/quarantine, MCP schemas, and result vocabulary.
-- Desktop Rust tests: connector merge/migration, fail-soft registration, atomic route creation, unmanaged-content preservation, and the ignored real-Science E2E.
-- Python contract tests: MCP all-mode compatibility, scoped uninstaller exposure, host-access protocol, unsigned/replay rejection through a dynamically bound Gateway, prelaunch registration, route attachment, dynamic uninstall naming, and native attach/detach result contract.
-- Real E2E: `runtime::skill_install_bridge::real_science_e2e::isolated_science_installs_attaches_and_persists_external_skill`.
-
-## Fail-safe and compatibility
-
-- Installer registration and every Skill failure are warning-only for CSSwitch startup.
-- A running Science instance is inspected read-only; changed MCP configuration requires a Science restart.
-- Successful route reconciliation is persisted by Science version, connector registration, and CSSwitch route revision. Normal repeated one-click opens skip attach/readback while that marker remains current; first configuration, relevant version/registration changes, and explicit self-check reconcile again. Failure remains warning-only and never updates the marker.
-- Host-access denial is final for that request. The Agent must report it, not retry alternate paths or fall back to authoring/catalog APIs.
-- `.import-origin`, local MCP loading, the local nonce/CSRF Agent-Skill endpoint, and `host.agents.attach_skill/detach_skill` behavior are observed Science contracts. Re-run the focused E2E after every bundled Science upgrade.
-- CSSwitch does not pin a Science version in the persistent data-dir. Normal selection is a valid explicit development `SCIENCE_BIN` override or the currently installed Science App. If the App is missing, a readable cache requires explicit one-launch UI authorization and is never persisted as a preference.
-- The local 0.1.15/0.1.18 observation was a wrong-binary startup incident, not evidence for a universal minimum version. Each actually selected Science version is probed and receives an idempotent route/MCP registration attempt. Failure is a `WARNING` for the external-Skill feature and never blocks Gateway or Science startup.
-- Install and uninstall resolve `active-org.json` and operate only on `<data-dir>/orgs/<active-org>/skills/<name>`. They never write to `<data-dir>/runtime/<version>/skills` or any version-runtime directory.
-- Local uninstall never calls Science catalog APIs and retains the complete directory in quarantine for manual recovery.
-
-## Explicitly out of scope
-
-No OAuth or catalog emulation; no Science binary patch; no private Science bearer use; no direct database writes; no bundled `customize` modification; no general Science control client; no Skill Manager, store, inventory, catalog, deployer, sync, general backup, update/overwrite, permanent deletion, restore UI, version manager, private-repository credentials, Python/R environment management, or domain libraries.
-
-## Accurate 0.5.0 wording
-
-“CSSwitch 0.5.0 inherits the user's currently installed Claude Science App and adds a fixed routing Skill plus one combined local install/uninstall connector. A URL request can install a complete public GitHub Skill into the active organization through a user-approved bridge, then attach and load it with Science's native Agent APIs. Uninstall quarantines only CSSwitch-owned imports before native detachment, without catalog-gated delete or shell removal. App-missing cache use requires explicit one-launch authorization. Name-only web source selection remains provider-dependent; private repositories, updates, overwrite, permanent deletion/restore UI, and each Skill's own domain function execution are not claimed.”
+不做 OAuth/catalog 模拟、Science binary patch、private bearer、SQLite 写入、Skill Manager/store/inventory/deployer、私有仓库 token、完整 Claude Plugin runtime、通用 control client 或离线仅提交模式。单 Skill 卸载保持既有流程；bundle 从任意成员触发整包校验、批量 detach 和 quarantine。
