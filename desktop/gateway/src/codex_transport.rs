@@ -9,6 +9,7 @@ use reqwest::{Client, Response};
 use zeroize::Zeroizing;
 
 use crate::codex_auth::InferenceSecrets;
+use crate::codex_network::CodexHttpClientFactory;
 use crate::config::{DEFAULT_CODEX_UPSTREAM_URL, UPSTREAM_UA};
 use crate::provider_contracts::CodexRuntimeContract;
 
@@ -125,31 +126,48 @@ impl std::error::Error for CodexTransportError {}
 
 impl CodexTransport {
     pub(crate) fn production(contract: &CodexRuntimeContract) -> Result<Self, CodexTransportError> {
-        Self::new(
+        let factory =
+            CodexHttpClientFactory::from_environment().map_err(|_| CodexTransportError {
+                status: 502,
+                upstream_status: None,
+                detail: "Codex network route initialization failed",
+                cancelled: false,
+            })?;
+        Self::new_with_factory(
             DEFAULT_CODEX_UPSTREAM_URL.to_string(),
             contract.connect_timeout,
             contract.request_timeout,
             contract.read_idle_timeout,
+            &factory,
         )
     }
 
     #[cfg(test)]
     pub(crate) fn for_test(endpoint: String) -> Result<Self, CodexTransportError> {
-        Self::new(
+        Self::new_with_factory(
             endpoint,
             CONNECT_TIMEOUT,
             READ_IDLE_TIMEOUT,
             READ_IDLE_TIMEOUT,
+            &CodexHttpClientFactory::direct_for_test(),
         )
     }
 
-    fn new(
+    fn new_with_factory(
         endpoint: String,
         connect_timeout: Duration,
         request_timeout: Duration,
         read_idle_timeout: Duration,
+        factory: &CodexHttpClientFactory,
     ) -> Result<Self, CodexTransportError> {
-        let client = Client::builder()
+        let client = factory
+            .async_builder()
+            .map_err(|_| CodexTransportError {
+                status: 502,
+                upstream_status: None,
+                detail: "Codex network route initialization failed",
+                cancelled: false,
+            })?
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .pool_max_idle_per_host(0)

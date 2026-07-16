@@ -2,6 +2,7 @@ pub mod anthropic_compat;
 pub mod auth;
 pub mod codex_auth;
 pub(crate) mod codex_models;
+pub(crate) mod codex_network;
 pub mod codex_protocol;
 pub(crate) mod codex_transport;
 pub mod config;

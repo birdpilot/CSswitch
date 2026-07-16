@@ -8,7 +8,7 @@ fn main() {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stdout().lock(),
-                "{{\"schema_version\":1,\"ok\":false,\"command\":null,\"error\":{{\"code\":\"internal_error\",\"message\":\"Codex auth sidecar build identity mismatch.\",\"retryable\":false}}}}"
+                "{{\"schema_version\":2,\"ok\":false,\"command\":null,\"error\":{{\"code\":\"internal_error\",\"message\":\"Codex auth sidecar build identity mismatch.\",\"retryable\":false}}}}"
             );
             std::process::exit(8);
         }
@@ -16,10 +16,14 @@ fn main() {
             .iter()
             .map(|arg| arg.to_str().map(str::to_string))
             .collect::<Option<Vec<_>>>();
-        let run = match codex_args {
-            Some(args) => csswitch_gateway::codex_auth::run_cli(&args),
-            None => csswitch_gateway::codex_auth::run_cli(&["invalid".into(), "invalid".into()]),
-        };
+        let args = codex_args.unwrap_or_else(|| vec!["invalid".into(), "invalid".into()]);
+        if let Some(exit_code) = csswitch_gateway::codex_auth::run_streaming_cli(&args) {
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+            return;
+        }
+        let run = csswitch_gateway::codex_auth::run_cli(&args);
         use std::io::Write as _;
         let _ = writeln!(std::io::stdout().lock(), "{}", run.json);
         if run.exit_code != 0 {

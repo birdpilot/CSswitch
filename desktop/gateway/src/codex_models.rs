@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 use crate::codex_auth::InferenceSecrets;
+use crate::codex_network::CodexHttpClientFactory;
 use crate::config::UPSTREAM_UA;
 use crate::provider_contracts::CodexRuntimeContract;
 
@@ -406,6 +407,15 @@ pub(crate) struct CodexModelCatalog {
     state: Mutex<CatalogState>,
 }
 
+#[derive(Clone, Copy)]
+struct CatalogPolicy {
+    retry_delays: [Duration; 2],
+    connect_timeout: Duration,
+    request_timeout: Duration,
+    normal_ttl_seconds: u64,
+    stale_ttl_seconds: u64,
+}
+
 impl fmt::Debug for CodexModelCatalog {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -421,17 +431,22 @@ impl CodexModelCatalog {
         state_root: PathBuf,
         contract: &CodexRuntimeContract,
     ) -> Result<Self, CodexModelsError> {
-        Self::new(
+        let factory =
+            CodexHttpClientFactory::from_environment().map_err(|_| CodexModelsError::network())?;
+        Self::new_with_factory(
             format!(
                 "{MODELS_ENDPOINT}?client_version={}",
                 contract.model_catalog_client_version
             ),
             state_root,
-            RETRY_DELAYS,
-            contract.connect_timeout,
-            contract.request_timeout,
-            contract.normal_ttl_seconds,
-            contract.stale_ttl_seconds,
+            CatalogPolicy {
+                retry_delays: RETRY_DELAYS,
+                connect_timeout: contract.connect_timeout,
+                request_timeout: contract.request_timeout,
+                normal_ttl_seconds: contract.normal_ttl_seconds,
+                stale_ttl_seconds: contract.stale_ttl_seconds,
+            },
+            &factory,
         )
     }
 
@@ -440,41 +455,43 @@ impl CodexModelCatalog {
         endpoint: String,
         state_root: PathBuf,
     ) -> Result<Self, CodexModelsError> {
-        Self::new(
+        Self::new_with_factory(
             endpoint,
             state_root,
-            [Duration::ZERO; 2],
-            CONNECT_TIMEOUT,
-            REQUEST_TIMEOUT,
-            NORMAL_TTL_SECONDS,
-            STALE_TTL_SECONDS,
+            CatalogPolicy {
+                retry_delays: [Duration::ZERO; 2],
+                connect_timeout: CONNECT_TIMEOUT,
+                request_timeout: REQUEST_TIMEOUT,
+                normal_ttl_seconds: NORMAL_TTL_SECONDS,
+                stale_ttl_seconds: STALE_TTL_SECONDS,
+            },
+            &CodexHttpClientFactory::direct_for_test(),
         )
     }
 
-    fn new(
+    fn new_with_factory(
         endpoint: String,
         state_root: PathBuf,
-        retry_delays: [Duration; 2],
-        connect_timeout: Duration,
-        request_timeout: Duration,
-        normal_ttl_seconds: u64,
-        stale_ttl_seconds: u64,
+        policy: CatalogPolicy,
+        factory: &CodexHttpClientFactory,
     ) -> Result<Self, CodexModelsError> {
-        let client = Client::builder()
+        let client = factory
+            .blocking_builder()
+            .map_err(|_| CodexModelsError::network())?
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .pool_max_idle_per_host(0)
-            .connect_timeout(connect_timeout)
-            .timeout(request_timeout)
+            .connect_timeout(policy.connect_timeout)
+            .timeout(policy.request_timeout)
             .build()
             .map_err(|_| CodexModelsError::network())?;
         Ok(Self {
             client,
             endpoint,
             state_root,
-            retry_delays,
-            normal_ttl_seconds,
-            stale_ttl_seconds,
+            retry_delays: policy.retry_delays,
+            normal_ttl_seconds: policy.normal_ttl_seconds,
+            stale_ttl_seconds: policy.stale_ttl_seconds,
             state: Mutex::new(CatalogState::default()),
         })
     }

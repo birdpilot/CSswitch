@@ -158,16 +158,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "csswitch-codex-network"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "url",
+]
+
+[[package]]
 name = "csswitch-gateway"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "csswitch-codex-network",
  "csswitch-skill-install-core",
  "getrandom 0.2.17",
  "hmac",
  "libc",
  "regex",
  "reqwest",
+ "rustls",
  "security-framework",
  "security-framework-sys",
  "serde",

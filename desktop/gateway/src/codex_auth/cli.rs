@@ -1,16 +1,22 @@
+use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::storage::StorageError;
 use super::{
-    production_status, run_production_login, run_production_logout, AuthStatus, OAuthErrorCode,
-    OAuthFlowError,
+    production_status, run_production_login_async, run_production_logout,
+    run_production_logout_local, AsyncLoginMethod, AuthStatus, LoginControl, LoginProgress,
+    OAuthErrorCode, OAuthFlowError,
 };
 
-const CLI_SCHEMA_VERSION: u32 = 1;
+const CLI_SCHEMA_VERSION: u32 = 2;
 const EXPIRING_WINDOW_SECONDS: i64 = 5 * 60;
+const MAX_NDJSON_LINE_BYTES: usize = 8 * 1024;
+const MAX_NDJSON_TOTAL_BYTES: usize = 64 * 1024;
+const OPERATION_ID_ENV: &str = "CSSWITCH_CODEX_AUTH_OPERATION_ID";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliRun {
@@ -20,7 +26,6 @@ pub struct CliRun {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
-    Login,
     Status,
     Logout,
 }
@@ -28,7 +33,6 @@ enum Command {
 impl Command {
     fn parse(args: &[String]) -> Option<Self> {
         match args {
-            [command] if command == "login" => Some(Self::Login),
             [command] if command == "status" => Some(Self::Status),
             [command] if command == "logout" => Some(Self::Logout),
             _ => None,
@@ -37,7 +41,6 @@ impl Command {
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::Login => "login",
             Self::Status => "status",
             Self::Logout => "logout",
         }
@@ -59,6 +62,16 @@ struct ErrorView<'a> {
     code: &'a str,
     message: &'a str,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    challenge_detected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_kind: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -67,6 +80,14 @@ struct SuccessEnvelope<'a> {
     ok: bool,
     command: &'a str,
     status: StatusView<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<WarningView<'a>>,
+}
+
+#[derive(Serialize)]
+struct WarningView<'a> {
+    code: &'a str,
+    reason: &'a str,
 }
 
 #[derive(Serialize)]
@@ -78,26 +99,26 @@ struct ErrorEnvelope<'a> {
 }
 
 trait AuthCommands {
-    fn login(&self) -> Result<AuthStatus, OAuthFlowError>;
     fn status(&self) -> Result<AuthStatus, OAuthFlowError>;
     fn logout(&self) -> Result<AuthStatus, OAuthFlowError>;
 }
 
 struct ProductionCommands {
     state_root: PathBuf,
+    logout_local_only: bool,
 }
 
 impl AuthCommands for ProductionCommands {
-    fn login(&self) -> Result<AuthStatus, OAuthFlowError> {
-        run_production_login(self.state_root.clone())
-    }
-
     fn status(&self) -> Result<AuthStatus, OAuthFlowError> {
         production_status(self.state_root.clone())
     }
 
     fn logout(&self) -> Result<AuthStatus, OAuthFlowError> {
-        run_production_logout(self.state_root.clone())
+        if self.logout_local_only {
+            run_production_logout_local(self.state_root.clone())
+        } else {
+            run_production_logout(self.state_root.clone())
+        }
     }
 }
 
@@ -106,7 +127,7 @@ pub fn run_cli(args: &[String]) -> CliRun {
         return error_run(
             None,
             "invalid_arguments",
-            "Usage: csswitch-gateway codex-auth login|status|logout",
+            "Usage: csswitch-gateway codex-auth login-device|login-browser|status|logout",
             false,
             2,
         );
@@ -131,7 +152,21 @@ pub fn run_cli(args: &[String]) -> CliRun {
             .ok()
             .and_then(|duration| i64::try_from(duration.as_secs()).ok())
             .unwrap_or(i64::MAX);
-        run_cli_with(command, now, &ProductionCommands { state_root })
+        let logout_local_only = command == Command::Logout
+            && std::env::var("CSSWITCH_CODEX_LOGOUT_SKIP_REVOKE").as_deref()
+                == Ok("proxy_config_invalid");
+        run_cli_with(
+            command,
+            now,
+            &ProductionCommands {
+                state_root,
+                logout_local_only,
+            },
+            logout_local_only.then_some(WarningView {
+                code: "revoke_skipped",
+                reason: "proxy_config_invalid",
+            }),
+        )
     }
 }
 
@@ -144,19 +179,28 @@ fn production_state_root() -> Result<PathBuf, StorageError> {
     Ok(home.join(".csswitch"))
 }
 
-fn run_cli_with(command: Command, now: i64, commands: &dyn AuthCommands) -> CliRun {
+fn run_cli_with(
+    command: Command,
+    now: i64,
+    commands: &dyn AuthCommands,
+    warning: Option<WarningView<'_>>,
+) -> CliRun {
     let result = match command {
-        Command::Login => commands.login(),
         Command::Status => commands.status(),
         Command::Logout => commands.logout(),
     };
     match result {
-        Ok(status) => success_run(command, now, &status),
+        Ok(status) => success_run(command, now, &status, warning),
         Err(error) => oauth_error_run(command, error),
     }
 }
 
-fn success_run(command: Command, now: i64, status: &AuthStatus) -> CliRun {
+fn success_run(
+    command: Command,
+    now: i64,
+    status: &AuthStatus,
+    warning: Option<WarningView<'_>>,
+) -> CliRun {
     let expiry_state = if !status.authenticated {
         "missing"
     } else {
@@ -181,18 +225,34 @@ fn success_run(command: Command, now: i64, status: &AuthStatus) -> CliRun {
             auth_epoch: status.auth_epoch.as_deref(),
             auth_generation: status.auth_generation,
         },
+        warning,
     };
     serialize_or_internal(&envelope)
 }
 
 fn oauth_error_run(command: Command, error: OAuthFlowError) -> CliRun {
-    error_run(
-        Some(command.as_str()),
-        error.code.as_str(),
-        error.message,
-        error.retryable,
-        exit_code(error.code),
-    )
+    let envelope = ErrorEnvelope {
+        schema_version: CLI_SCHEMA_VERSION,
+        ok: false,
+        command: Some(command.as_str()),
+        error: ErrorView {
+            code: error.code.as_str(),
+            message: error.message,
+            retryable: error.retryable,
+            stage: Some(error.stage),
+            upstream_status: error.upstream_status,
+            response_kind: error.response_kind,
+            challenge_detected: error.challenge_detected,
+            transport_kind: error.transport_kind,
+        },
+    };
+    match serde_json::to_string(&envelope) {
+        Ok(json) => CliRun {
+            json,
+            exit_code: exit_code(error.code),
+        },
+        Err(_) => internal_serialization_error(),
+    }
 }
 
 fn error_run(
@@ -210,6 +270,11 @@ fn error_run(
             code,
             message,
             retryable,
+            stage: None,
+            upstream_status: None,
+            response_kind: None,
+            challenge_detected: None,
+            transport_kind: None,
         },
     };
     match serde_json::to_string(&envelope) {
@@ -227,9 +292,298 @@ fn serialize_or_internal(value: &impl Serialize) -> CliRun {
 
 fn internal_serialization_error() -> CliRun {
     CliRun {
-        json: "{\"schema_version\":1,\"ok\":false,\"command\":null,\"error\":{\"code\":\"internal_error\",\"message\":\"Codex auth output could not be encoded\",\"retryable\":false}}".into(),
+        json: "{\"schema_version\":2,\"ok\":false,\"command\":null,\"error\":{\"code\":\"internal_error\",\"message\":\"Codex auth output could not be encoded\",\"retryable\":false}}".into(),
         exit_code: 8,
     }
+}
+
+#[derive(Serialize)]
+struct StreamingEvent<'a> {
+    schema_version: u32,
+    operation_id: &'a str,
+    kind: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verification_url: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_code: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disposition: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<StatusView<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<StreamingError<'a>>,
+}
+
+#[derive(Serialize)]
+struct StreamingError<'a> {
+    code: &'a str,
+    stage: &'a str,
+    retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_kind: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    challenge_detected: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport_kind: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelInput {
+    schema_version: u32,
+    operation_id: String,
+    command: String,
+}
+
+#[derive(Clone)]
+struct NdjsonWriter {
+    inner: Arc<Mutex<NdjsonWriterInner>>,
+}
+
+struct NdjsonWriterInner {
+    output: std::io::Stdout,
+    total: usize,
+    failed: bool,
+}
+
+impl NdjsonWriter {
+    fn stdout() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(NdjsonWriterInner {
+                output: std::io::stdout(),
+                total: 0,
+                failed: false,
+            })),
+        }
+    }
+
+    fn emit(&self, value: &impl Serialize) -> Result<(), ()> {
+        let mut line = serde_json::to_vec(value).map_err(|_| ())?;
+        if line.len() > MAX_NDJSON_LINE_BYTES || line.contains(&b'\n') || line.contains(&b'\r') {
+            return Err(());
+        }
+        line.push(b'\n');
+        let mut inner = self.inner.lock().map_err(|_| ())?;
+        if inner.failed || inner.total.saturating_add(line.len()) > MAX_NDJSON_TOTAL_BYTES {
+            inner.failed = true;
+            return Err(());
+        }
+        if inner.output.write_all(&line).is_err() || inner.output.flush().is_err() {
+            inner.failed = true;
+            return Err(());
+        }
+        inner.total += line.len();
+        Ok(())
+    }
+}
+
+pub fn run_streaming_cli(args: &[String]) -> Option<i32> {
+    let method = match args {
+        [command] if command == "login-device" => AsyncLoginMethod::Device,
+        [command] if command == "login-browser" => AsyncLoginMethod::Browser,
+        [command, ..] if command == "login-device" || command == "login-browser" => return Some(2),
+        _ => return None,
+    };
+    let operation_id = match std::env::var(OPERATION_ID_ENV) {
+        Ok(value) if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            value
+        }
+        _ => return Some(2),
+    };
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (method, operation_id);
+        return Some(6);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let state_root = match production_state_root() {
+            Ok(root) => root,
+            Err(_) => return Some(6),
+        };
+        let writer = NdjsonWriter::stdout();
+        let control = LoginControl::default();
+        spawn_cancel_reader(operation_id.clone(), control.clone(), writer.clone());
+        let progress_writer = writer.clone();
+        let progress_operation_id = operation_id.clone();
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => return Some(8),
+        };
+        let result = runtime.block_on(run_production_login_async(
+            state_root,
+            method,
+            &control,
+            move |progress| {
+                let event = match &progress {
+                    LoginProgress::VerificationRequired {
+                        verification_url,
+                        user_code,
+                        expires_at_ms,
+                    } => StreamingEvent {
+                        schema_version: CLI_SCHEMA_VERSION,
+                        operation_id: &progress_operation_id,
+                        kind: "progress",
+                        state: Some("verification_required"),
+                        verification_url: Some(verification_url),
+                        user_code: Some(user_code),
+                        expires_at_ms: Some(*expires_at_ms),
+                        disposition: None,
+                        status: None,
+                        error: None,
+                    },
+                    LoginProgress::Waiting => progress_event(&progress_operation_id, "waiting"),
+                    LoginProgress::Exchanging => {
+                        progress_event(&progress_operation_id, "exchanging")
+                    }
+                    LoginProgress::Committing => {
+                        progress_event(&progress_operation_id, "committing")
+                    }
+                };
+                let _ = progress_writer.emit(&event);
+            },
+        ));
+        let (state, status, error, code) = match &result {
+            Ok(status) => (
+                "succeeded",
+                Some(status_view(now_seconds(), status)),
+                None,
+                0,
+            ),
+            Err(error) if error.code == OAuthErrorCode::AuthCancelled => (
+                "cancelled",
+                None,
+                Some(streaming_error(error)),
+                exit_code(error.code),
+            ),
+            Err(error) => (
+                "failed",
+                None,
+                Some(streaming_error(error)),
+                exit_code(error.code),
+            ),
+        };
+        let terminal = StreamingEvent {
+            schema_version: CLI_SCHEMA_VERSION,
+            operation_id: &operation_id,
+            kind: "terminal",
+            state: Some(state),
+            verification_url: None,
+            user_code: None,
+            expires_at_ms: None,
+            disposition: None,
+            status,
+            error,
+        };
+        if writer.emit(&terminal).is_err() {
+            return Some(8);
+        }
+        Some(code)
+    }
+}
+
+fn progress_event<'a>(operation_id: &'a str, state: &'a str) -> StreamingEvent<'a> {
+    StreamingEvent {
+        schema_version: CLI_SCHEMA_VERSION,
+        operation_id,
+        kind: "progress",
+        state: Some(state),
+        verification_url: None,
+        user_code: None,
+        expires_at_ms: None,
+        disposition: None,
+        status: None,
+        error: None,
+    }
+}
+
+fn streaming_error(error: &OAuthFlowError) -> StreamingError<'_> {
+    StreamingError {
+        code: error.code.as_str(),
+        stage: error.stage,
+        retryable: error.retryable,
+        upstream_status: error.upstream_status,
+        response_kind: error.response_kind,
+        challenge_detected: error.challenge_detected,
+        transport_kind: error.transport_kind,
+    }
+}
+
+fn status_view(now: i64, status: &AuthStatus) -> StatusView<'_> {
+    let expiry_state = if !status.authenticated {
+        "missing"
+    } else {
+        match status.expires_at {
+            None => "unknown",
+            Some(expires_at) if expires_at <= now => "expired",
+            Some(expires_at) if expires_at <= now.saturating_add(EXPIRING_WINDOW_SECONDS) => {
+                "expiring"
+            }
+            Some(_) => "valid",
+        }
+    };
+    StatusView {
+        authenticated: status.authenticated,
+        account_hash: status.account_hash.as_deref(),
+        expiry_state,
+        expires_at: status.expires_at,
+        auth_epoch: status.auth_epoch.as_deref(),
+        auth_generation: status.auth_generation,
+    }
+}
+
+fn now_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(i64::MAX)
+}
+
+fn spawn_cancel_reader(operation_id: String, control: LoginControl, writer: NdjsonWriter) {
+    std::thread::spawn(move || {
+        let mut input =
+            std::io::BufReader::new(std::io::stdin()).take((MAX_NDJSON_LINE_BYTES + 1) as u64);
+        let mut line = Vec::new();
+        if input.read_until(b'\n', &mut line).is_err()
+            || line.len() > MAX_NDJSON_LINE_BYTES
+            || !line.ends_with(b"\n")
+        {
+            return;
+        }
+        let Ok(cancel) = serde_json::from_slice::<CancelInput>(&line) else {
+            return;
+        };
+        if cancel.schema_version != CLI_SCHEMA_VERSION
+            || cancel.operation_id != operation_id
+            || cancel.command != "cancel"
+        {
+            return;
+        }
+        let disposition = control.cancel();
+        let event = StreamingEvent {
+            schema_version: CLI_SCHEMA_VERSION,
+            operation_id: &operation_id,
+            kind: "cancel_ack",
+            state: None,
+            verification_url: None,
+            user_code: None,
+            expires_at_ms: None,
+            disposition: Some(disposition.as_str()),
+            status: None,
+            error: None,
+        };
+        let _ = writer.emit(&event);
+    });
 }
 
 fn exit_code(code: OAuthErrorCode) -> i32 {
@@ -244,7 +598,14 @@ fn exit_code(code: OAuthErrorCode) -> i32 {
         | OAuthErrorCode::KeychainUnavailable
         | OAuthErrorCode::Storage
         | OAuthErrorCode::UnsupportedPlatform => 6,
-        OAuthErrorCode::OAuthNetwork | OAuthErrorCode::OAuthProtocol => 7,
+        OAuthErrorCode::OAuthNetwork
+        | OAuthErrorCode::OAuthProtocol
+        | OAuthErrorCode::OAuthUnexpectedContentType
+        | OAuthErrorCode::OAuthChallengeResponse
+        | OAuthErrorCode::ProxyConnectFailed
+        | OAuthErrorCode::TlsFailed
+        | OAuthErrorCode::DeviceAuthUnavailable
+        | OAuthErrorCode::AuthCancelled => 7,
     }
 }
 
@@ -258,10 +619,6 @@ mod tests {
     }
 
     impl AuthCommands for FakeCommands {
-        fn login(&self) -> Result<AuthStatus, OAuthFlowError> {
-            self.result.clone()
-        }
-
         fn status(&self) -> Result<AuthStatus, OAuthFlowError> {
             self.result.clone()
         }
@@ -289,11 +646,12 @@ mod tests {
             &FakeCommands {
                 result: Ok(status(true, Some(2_000))),
             },
+            None,
         );
         assert_eq!(run.exit_code, 0);
         assert!(!run.json.contains('\n'));
         let value: Value = serde_json::from_str(&run.json).unwrap();
-        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["schema_version"], 2);
         assert_eq!(value["ok"], true);
         assert_eq!(value["command"], "status");
         assert_eq!(value["status"]["expiry_state"], "valid");
@@ -317,6 +675,7 @@ mod tests {
                 &FakeCommands {
                     result: Ok(status(authenticated, expires_at)),
                 },
+                None,
             );
             let value: Value = serde_json::from_str(&run.json).unwrap();
             assert_eq!(value["status"]["expiry_state"], expected);
@@ -327,12 +686,45 @@ mod tests {
     fn errors_keep_stable_codes_exit_codes_and_redaction() {
         let private_detail = "private-token-detail";
         let error = OAuthFlowError::from(StorageError::InvalidState(private_detail.into()));
-        let run = run_cli_with(Command::Login, 0, &FakeCommands { result: Err(error) });
+        let run = run_cli_with(
+            Command::Status,
+            0,
+            &FakeCommands { result: Err(error) },
+            None,
+        );
         assert_eq!(run.exit_code, 6);
         assert!(!run.json.contains(private_detail));
         let value: Value = serde_json::from_str(&run.json).unwrap();
         assert_eq!(value["error"]["code"], "auth_state_invalid");
-        assert_eq!(value["command"], "login");
+        assert_eq!(value["command"], "status");
+    }
+
+    #[test]
+    fn local_logout_warning_is_bounded_and_contains_no_route_details() {
+        let run = run_cli_with(
+            Command::Logout,
+            1_000,
+            &FakeCommands {
+                result: Ok(status(false, None)),
+            },
+            Some(WarningView {
+                code: "revoke_skipped",
+                reason: "proxy_config_invalid",
+            }),
+        );
+        assert_eq!(run.exit_code, 0);
+        let value: Value = serde_json::from_str(&run.json).unwrap();
+        assert_eq!(value["warning"]["code"], "revoke_skipped");
+        assert_eq!(value["warning"]["reason"], "proxy_config_invalid");
+        for forbidden in [
+            "proxy_url",
+            "http://",
+            "https://",
+            "socks5://",
+            "socks5h://",
+        ] {
+            assert!(!run.json.contains(forbidden));
+        }
     }
 
     #[test]

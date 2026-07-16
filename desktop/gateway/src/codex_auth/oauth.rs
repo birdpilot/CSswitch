@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::codex_network::CodexHttpClientFactory;
+
 use super::storage::{
     AuthRepository, AuthStatus, NewOAuthTokens, RefreshUpdate, RevokeToken, RevokeTokenKind,
     SecretStore, StateStore, StorageError,
@@ -49,6 +51,12 @@ pub enum OAuthErrorCode {
     OAuthDenied,
     OAuthNetwork,
     OAuthProtocol,
+    OAuthUnexpectedContentType,
+    OAuthChallengeResponse,
+    ProxyConnectFailed,
+    TlsFailed,
+    DeviceAuthUnavailable,
+    AuthCancelled,
     Storage,
     UnsupportedPlatform,
 }
@@ -67,6 +75,12 @@ impl OAuthErrorCode {
             Self::OAuthDenied => "oauth_denied",
             Self::OAuthNetwork => "oauth_network_error",
             Self::OAuthProtocol => "oauth_protocol_error",
+            Self::OAuthUnexpectedContentType => "oauth_unexpected_content_type",
+            Self::OAuthChallengeResponse => "oauth_challenge_response",
+            Self::ProxyConnectFailed => "proxy_connect_failed",
+            Self::TlsFailed => "tls_failed",
+            Self::DeviceAuthUnavailable => "device_auth_unavailable",
+            Self::AuthCancelled => "auth_cancelled",
             Self::Storage => "auth_storage_error",
             Self::UnsupportedPlatform => "unsupported_platform",
         }
@@ -78,6 +92,11 @@ pub struct OAuthFlowError {
     pub code: OAuthErrorCode,
     pub retryable: bool,
     pub message: &'static str,
+    pub stage: &'static str,
+    pub upstream_status: Option<u16>,
+    pub response_kind: Option<&'static str>,
+    pub challenge_detected: Option<bool>,
+    pub transport_kind: Option<&'static str>,
 }
 
 impl fmt::Debug for OAuthFlowError {
@@ -86,6 +105,11 @@ impl fmt::Debug for OAuthFlowError {
             .field("code", &self.code)
             .field("retryable", &self.retryable)
             .field("message", &self.message)
+            .field("stage", &self.stage)
+            .field("upstream_status", &self.upstream_status)
+            .field("response_kind", &self.response_kind)
+            .field("challenge_detected", &self.challenge_detected)
+            .field("transport_kind", &self.transport_kind)
             .finish()
     }
 }
@@ -141,16 +165,43 @@ impl From<StorageError> for OAuthFlowError {
 }
 
 impl OAuthFlowError {
-    fn new(code: OAuthErrorCode, retryable: bool, message: &'static str) -> Self {
+    pub(crate) fn new(code: OAuthErrorCode, retryable: bool, message: &'static str) -> Self {
         Self {
             code,
             retryable,
             message,
+            stage: "token_exchange",
+            upstream_status: None,
+            response_kind: None,
+            challenge_detected: None,
+            transport_kind: None,
         }
     }
 
-    fn protocol(message: &'static str) -> Self {
+    pub(super) fn protocol(message: &'static str) -> Self {
         Self::new(OAuthErrorCode::OAuthProtocol, false, message)
+    }
+
+    pub(super) fn at_stage(mut self, stage: &'static str) -> Self {
+        self.stage = stage;
+        self
+    }
+
+    pub(super) fn with_http(
+        mut self,
+        status: Option<u16>,
+        response_kind: Option<&'static str>,
+        challenge_detected: Option<bool>,
+    ) -> Self {
+        self.upstream_status = status;
+        self.response_kind = response_kind;
+        self.challenge_detected = challenge_detected;
+        self
+    }
+
+    pub(super) fn with_transport(mut self, transport_kind: &'static str) -> Self {
+        self.transport_kind = Some(transport_kind);
+        self
     }
 }
 
@@ -240,6 +291,7 @@ pub struct HttpOAuthTransport {
     revoke_endpoint: String,
     client_id: String,
     client: Client,
+    has_proxy: bool,
 }
 
 impl fmt::Debug for HttpOAuthTransport {
@@ -254,13 +306,25 @@ impl fmt::Debug for HttpOAuthTransport {
 
 impl HttpOAuthTransport {
     pub fn production() -> Result<Self, OAuthFlowError> {
-        Self::new(
+        let factory = CodexHttpClientFactory::from_environment().map_err(|_| {
+            OAuthFlowError::new(
+                OAuthErrorCode::OAuthNetwork,
+                false,
+                "The Codex network route is invalid",
+            )
+        })?;
+        Self::new_with_factory(
             format!("{CODEX_OAUTH_ISSUER}/oauth/token"),
             CODEX_OAUTH_CLIENT_ID.to_string(),
+            &factory,
         )
     }
 
-    fn new(token_endpoint: String, client_id: String) -> Result<Self, OAuthFlowError> {
+    fn new_with_factory(
+        token_endpoint: String,
+        client_id: String,
+        factory: &CodexHttpClientFactory,
+    ) -> Result<Self, OAuthFlowError> {
         let mut endpoint = url::Url::parse(&token_endpoint)
             .map_err(|_| OAuthFlowError::protocol("The OAuth token endpoint is invalid"))?;
         if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
@@ -272,7 +336,15 @@ impl HttpOAuthTransport {
         endpoint.set_query(None);
         endpoint.set_fragment(None);
         let revoke_endpoint: String = endpoint.into();
-        let client = Client::builder()
+        let client = factory
+            .blocking_builder()
+            .map_err(|_| {
+                OAuthFlowError::new(
+                    OAuthErrorCode::OAuthNetwork,
+                    false,
+                    "The Codex network route is invalid",
+                )
+            })?
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .redirect(Policy::none())
@@ -289,7 +361,17 @@ impl HttpOAuthTransport {
             revoke_endpoint,
             client_id,
             client,
+            has_proxy: factory.has_proxy(),
         })
+    }
+
+    #[cfg(test)]
+    fn new(token_endpoint: String, client_id: String) -> Result<Self, OAuthFlowError> {
+        Self::new_with_factory(
+            token_endpoint,
+            client_id,
+            &CodexHttpClientFactory::direct_for_test(),
+        )
     }
 
     #[cfg(test)]
@@ -298,7 +380,11 @@ impl HttpOAuthTransport {
         revoke_endpoint: String,
         client_id: String,
     ) -> Result<Self, OAuthFlowError> {
-        let mut transport = Self::new(token_endpoint, client_id)?;
+        let mut transport = Self::new_with_factory(
+            token_endpoint,
+            client_id,
+            &CodexHttpClientFactory::direct_for_test(),
+        )?;
         let endpoint = url::Url::parse(&revoke_endpoint)
             .map_err(|_| OAuthFlowError::protocol("The OAuth revoke endpoint is invalid"))?;
         if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
@@ -342,17 +428,18 @@ impl OAuthTransport for HttpOAuthTransport {
             .header("user-agent", crate::config::UPSTREAM_UA)
             .body(body)
             .send()
-            .map_err(|_| {
-                OAuthFlowError::new(
-                    OAuthErrorCode::OAuthNetwork,
-                    true,
+            .map_err(|error| {
+                request_error(
+                    &error,
+                    self.has_proxy,
+                    "token_exchange",
                     "The OAuth token exchange could not connect",
                 )
             })?;
         if !response.status().is_success() {
-            return Err(OAuthFlowError::new(
-                OAuthErrorCode::OAuthProtocol,
-                false,
+            return Err(blocking_response_error(
+                &response,
+                "token_exchange",
                 "The OAuth token exchange was rejected",
             ));
         }
@@ -520,21 +607,22 @@ impl RefreshTransport for HttpOAuthTransport {
             .header("user-agent", crate::config::UPSTREAM_UA)
             .body(body.to_vec())
             .send()
-            .map_err(|_| {
-                OAuthFlowError::new(
-                    OAuthErrorCode::OAuthNetwork,
-                    true,
+            .map_err(|error| {
+                request_error(
+                    &error,
+                    self.has_proxy,
+                    "refresh",
                     "The OAuth refresh request could not connect",
                 )
             })?;
         if !response.status().is_success() {
-            return Err(OAuthFlowError::new(
-                OAuthErrorCode::OAuthProtocol,
-                false,
+            return Err(blocking_response_error(
+                &response,
+                "refresh",
                 "The OAuth refresh request was rejected",
             ));
         }
-        let response = read_bounded_json::<RefreshResponse>(response)?;
+        let response = read_bounded_json::<RefreshResponse>(response, "refresh")?;
         response.into_update()
     }
 }
@@ -569,19 +657,20 @@ impl RevokeTransport for HttpOAuthTransport {
             .header("user-agent", crate::config::UPSTREAM_UA)
             .body(body.to_vec())
             .send()
-            .map_err(|_| {
-                OAuthFlowError::new(
-                    OAuthErrorCode::OAuthNetwork,
-                    true,
+            .map_err(|error| {
+                request_error(
+                    &error,
+                    self.has_proxy,
+                    "revoke",
                     "The OAuth revoke request could not connect",
                 )
             })?;
         if response.status().is_success() {
             Ok(())
         } else {
-            Err(OAuthFlowError::new(
-                OAuthErrorCode::OAuthProtocol,
-                false,
+            Err(blocking_response_error(
+                &response,
+                "revoke",
                 "The OAuth revoke request was rejected",
             ))
         }
@@ -590,12 +679,26 @@ impl RevokeTransport for HttpOAuthTransport {
 
 fn read_bounded_json<T: for<'de> Deserialize<'de>>(
     response: reqwest::blocking::Response,
+    stage: &'static str,
 ) -> Result<T, OAuthFlowError> {
+    let status = response.status().as_u16();
+    let (declared_kind, challenge) = blocking_response_metadata(&response);
+    if challenge {
+        return Err(OAuthFlowError::new(
+            OAuthErrorCode::OAuthChallengeResponse,
+            true,
+            "The OAuth endpoint returned a challenge response",
+        )
+        .at_stage(stage)
+        .with_http(Some(status), Some(declared_kind), Some(true)));
+    }
     if response
         .content_length()
         .is_some_and(|length| length > MAX_TOKEN_RESPONSE)
     {
-        return Err(OAuthFlowError::protocol("The OAuth response is too large"));
+        return Err(OAuthFlowError::protocol("The OAuth response is too large")
+            .at_stage(stage)
+            .with_http(Some(status), Some(declared_kind), Some(false)));
     }
     let mut bytes = Zeroizing::new(Vec::new());
     response
@@ -607,12 +710,113 @@ fn read_bounded_json<T: for<'de> Deserialize<'de>>(
                 true,
                 "The OAuth response could not be read",
             )
+            .at_stage(stage)
+            .with_http(Some(status), Some(declared_kind), Some(false))
+            .with_transport("http")
         })?;
     if bytes.len() as u64 > MAX_TOKEN_RESPONSE {
-        return Err(OAuthFlowError::protocol("The OAuth response is too large"));
+        return Err(OAuthFlowError::protocol("The OAuth response is too large")
+            .at_stage(stage)
+            .with_http(Some(status), Some(declared_kind), Some(false)));
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|_| OAuthFlowError::protocol("The OAuth response is invalid"))
+    let response_kind = response_kind(declared_kind, bytes.is_empty());
+    if response_kind != "json" {
+        return Err(OAuthFlowError::new(
+            OAuthErrorCode::OAuthUnexpectedContentType,
+            true,
+            "The OAuth endpoint returned an unexpected content type",
+        )
+        .at_stage(stage)
+        .with_http(Some(status), Some(response_kind), Some(false)));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| {
+        OAuthFlowError::protocol("The OAuth response is invalid")
+            .at_stage(stage)
+            .with_http(Some(status), Some(response_kind), Some(false))
+    })
+}
+
+fn request_error(
+    error: &reqwest::Error,
+    has_proxy: bool,
+    stage: &'static str,
+    message: &'static str,
+) -> OAuthFlowError {
+    let (code, transport) = super::login_async::classify_request_error(error, has_proxy);
+    OAuthFlowError::new(code, true, message)
+        .at_stage(stage)
+        .with_transport(transport)
+}
+
+fn blocking_response_metadata(response: &reqwest::blocking::Response) -> (&'static str, bool) {
+    let challenge = response
+        .headers()
+        .get("cf-mitigated")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("challenge"));
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim);
+    let kind = declared_response_kind(content_type);
+    (kind, challenge)
+}
+
+pub(super) fn declared_response_kind(content_type: Option<&str>) -> &'static str {
+    let Some(value) = content_type else {
+        return "unknown";
+    };
+    let value = value.split(';').next().unwrap_or_default().trim();
+    if value.eq_ignore_ascii_case("application/json")
+        || value.to_ascii_lowercase().ends_with("+json")
+    {
+        "json"
+    } else if value.eq_ignore_ascii_case("text/html")
+        || value.eq_ignore_ascii_case("application/xhtml+xml")
+    {
+        "html"
+    } else {
+        "other"
+    }
+}
+
+pub(super) fn response_kind(declared_kind: &'static str, body_is_empty: bool) -> &'static str {
+    if body_is_empty {
+        "empty"
+    } else {
+        declared_kind
+    }
+}
+
+fn blocking_response_error(
+    response: &reqwest::blocking::Response,
+    stage: &'static str,
+    protocol_message: &'static str,
+) -> OAuthFlowError {
+    let status = response.status().as_u16();
+    let (kind, challenge) = blocking_response_metadata(response);
+    if challenge {
+        OAuthFlowError::new(
+            OAuthErrorCode::OAuthChallengeResponse,
+            true,
+            "The OAuth endpoint returned a challenge response",
+        )
+        .at_stage(stage)
+        .with_http(Some(status), Some(kind), Some(true))
+    } else if matches!(kind, "html" | "other" | "unknown") {
+        OAuthFlowError::new(
+            OAuthErrorCode::OAuthUnexpectedContentType,
+            true,
+            "The OAuth endpoint returned an unexpected content type",
+        )
+        .at_stage(stage)
+        .with_http(Some(status), Some(kind), Some(false))
+    } else {
+        OAuthFlowError::new(OAuthErrorCode::OAuthProtocol, false, protocol_message)
+            .at_stage(stage)
+            .with_http(Some(status), Some(kind), Some(false))
+    }
 }
 
 #[derive(Deserialize)]
@@ -620,6 +824,12 @@ struct TokenResponse {
     id_token: String,
     access_token: String,
     refresh_token: String,
+}
+
+pub(super) fn parse_new_oauth_tokens(bytes: &[u8]) -> Result<NewOAuthTokens, OAuthFlowError> {
+    serde_json::from_slice::<TokenResponse>(bytes)
+        .map_err(|_| OAuthFlowError::protocol("The OAuth token response is invalid"))?
+        .into_tokens()
 }
 
 impl TokenResponse {
@@ -1493,6 +1703,23 @@ mod tests {
     }
 
     #[test]
+    fn response_kind_contract_covers_json_html_empty_other_and_unknown() {
+        assert_eq!(declared_response_kind(Some("application/json")), "json");
+        assert_eq!(
+            declared_response_kind(Some("application/problem+json; charset=utf-8")),
+            "json"
+        );
+        assert_eq!(
+            declared_response_kind(Some("text/html; charset=UTF-8")),
+            "html"
+        );
+        assert_eq!(declared_response_kind(Some("text/plain")), "other");
+        assert_eq!(declared_response_kind(None), "unknown");
+        assert_eq!(response_kind("json", true), "empty");
+        assert_eq!(response_kind("other", false), "other");
+    }
+
+    #[test]
     fn token_response_limits_cover_declared_and_streamed_oversize_bodies() {
         let declared = FakeOAuthServer::raw(
             format!(
@@ -1559,7 +1786,10 @@ mod tests {
                 Instant::now() + Duration::from_secs(2),
             )
             .unwrap_err();
-        assert_eq!(error.code, OAuthErrorCode::OAuthProtocol);
+        assert_eq!(error.code, OAuthErrorCode::OAuthUnexpectedContentType);
+        assert_eq!(error.stage, "token_exchange");
+        assert_eq!(error.upstream_status, Some(307));
+        assert_eq!(error.response_kind, Some("unknown"));
         thread::sleep(Duration::from_millis(20));
         assert_eq!(
             target.accept().unwrap_err().kind(),

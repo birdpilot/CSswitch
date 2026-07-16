@@ -1,10 +1,12 @@
 mod cli;
+mod login_async;
 mod oauth;
 mod storage;
 
 use std::path::PathBuf;
 
-pub use cli::{run_cli, CliRun};
+pub use cli::{run_cli, run_streaming_cli, CliRun};
+pub use login_async::{AsyncLoginMethod, CancelDisposition, LoginControl, LoginProgress};
 pub use oauth::{OAuthErrorCode, OAuthFlowError};
 pub use storage::AuthStatus;
 pub(crate) use storage::InferenceSecrets;
@@ -46,6 +48,27 @@ pub fn run_production_login(state_root: PathBuf) -> Result<AuthStatus, OAuthFlow
     #[cfg(not(target_os = "macos"))]
     {
         let _ = state_root;
+        Err(storage::StorageError::UnsupportedPlatform.into())
+    }
+}
+
+pub async fn run_production_login_async<F>(
+    state_root: PathBuf,
+    method: AsyncLoginMethod,
+    control: &LoginControl,
+    progress: F,
+) -> Result<AuthStatus, OAuthFlowError>
+where
+    F: Fn(LoginProgress),
+{
+    #[cfg(target_os = "macos")]
+    {
+        let repository = storage::AuthRepository::production(state_root);
+        login_async::run_production_login(&repository, method, control, progress).await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (state_root, method, control, progress);
         Err(storage::StorageError::UnsupportedPlatform.into())
     }
 }
@@ -92,6 +115,19 @@ pub fn run_production_logout(state_root: PathBuf) -> Result<AuthStatus, OAuthFlo
                 .as_ref()
                 .map(|transport| transport as &dyn oauth::RevokeTransport),
         )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state_root;
+        Err(storage::StorageError::UnsupportedPlatform.into())
+    }
+}
+
+pub fn run_production_logout_local(state_root: PathBuf) -> Result<AuthStatus, OAuthFlowError> {
+    #[cfg(target_os = "macos")]
+    {
+        let repository = storage::AuthRepository::production(state_root);
+        run_logout(&repository, None)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -299,11 +335,11 @@ mod lifecycle_tests {
 
     impl oauth::RefreshTransport for FailedRefresh {
         fn refresh(&self, _refresh_token: &str) -> Result<storage::RefreshUpdate, OAuthFlowError> {
-            Err(OAuthFlowError {
-                code: OAuthErrorCode::OAuthNetwork,
-                retryable: true,
-                message: "injected refresh failure",
-            })
+            Err(OAuthFlowError::new(
+                OAuthErrorCode::OAuthNetwork,
+                true,
+                "injected refresh failure",
+            ))
         }
     }
 
@@ -325,11 +361,11 @@ mod lifecycle_tests {
     impl oauth::RevokeTransport for FailedRevoke {
         fn revoke(&self, _token: &storage::RevokeToken) -> Result<(), OAuthFlowError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            Err(OAuthFlowError {
-                code: OAuthErrorCode::OAuthNetwork,
-                retryable: true,
-                message: "injected revoke failure",
-            })
+            Err(OAuthFlowError::new(
+                OAuthErrorCode::OAuthNetwork,
+                true,
+                "injected revoke failure",
+            ))
         }
     }
 

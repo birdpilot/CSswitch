@@ -2781,19 +2781,19 @@ mod tests {
 
     #[test]
     fn codex_auth_errors_distinguish_login_from_transient_refresh_failure() {
-        let missing = map_codex_auth_error(OAuthFlowError {
-            code: OAuthErrorCode::NotAuthenticated,
-            retryable: false,
-            message: "missing",
-        });
+        let missing = map_codex_auth_error(OAuthFlowError::new(
+            OAuthErrorCode::NotAuthenticated,
+            false,
+            "missing",
+        ));
         assert_eq!(missing.status, 401);
         assert_eq!(missing.error_type, "authentication_error");
 
-        let network = map_codex_auth_error(OAuthFlowError {
-            code: OAuthErrorCode::OAuthNetwork,
-            retryable: true,
-            message: "network",
-        });
+        let network = map_codex_auth_error(OAuthFlowError::new(
+            OAuthErrorCode::OAuthNetwork,
+            true,
+            "network",
+        ));
         assert_eq!(network.status, 503);
         assert_eq!(network.error_type, "api_error");
         assert_ne!(network.message, "Codex login is required");
