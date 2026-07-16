@@ -106,6 +106,53 @@ persist_ports() {
   chmod 600 "$PORT_STATE"
 }
 
+prepare_isolated_keychain() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  command -v security >/dev/null 2>&1 || \
+    die "macOS Acceptance 验收需要 security 命令初始化隔离钥匙串"
+
+  local library_dir="$TEST_HOME/Library"
+  local keychain_dir="$library_dir/Keychains"
+  local preferences_dir="$library_dir/Preferences"
+  local keychain="$keychain_dir/login.keychain-db"
+  local default_keychain
+
+  reject_symlinks \
+    "$library_dir" "$keychain_dir" "$preferences_dir" "$keychain"
+  umask 077
+  mkdir -p "$keychain_dir" "$preferences_dir"
+  chmod 700 "$library_dir" "$keychain_dir" "$preferences_dir"
+  reject_symlinks \
+    "$library_dir" "$keychain_dir" "$preferences_dir" "$keychain"
+  keychain_dir="$(cd "$keychain_dir" 2>/dev/null && pwd -P)" || \
+    die "无法规范化 Acceptance 隔离钥匙串目录"
+  keychain="$keychain_dir/login.keychain-db"
+
+  if [ ! -f "$keychain" ]; then
+    HOME="$TEST_HOME" security create-keychain -p "" "$keychain" >/dev/null 2>&1 || \
+      die "无法创建 Acceptance 隔离钥匙串"
+  fi
+  [ -f "$keychain" ] && [ ! -L "$keychain" ] || \
+    die "Acceptance 隔离钥匙串不是普通文件"
+
+  HOME="$TEST_HOME" security list-keychains -d user -s "$keychain" >/dev/null 2>&1 || \
+    die "无法设置 Acceptance 隔离钥匙串搜索列表"
+  HOME="$TEST_HOME" security default-keychain -d user -s "$keychain" >/dev/null 2>&1 || \
+    die "无法设置 Acceptance 隔离默认钥匙串"
+  HOME="$TEST_HOME" security unlock-keychain -p "" "$keychain" >/dev/null 2>&1 || \
+    die "无法解锁 Acceptance 隔离钥匙串"
+  HOME="$TEST_HOME" security set-keychain-settings "$keychain" >/dev/null 2>&1 || \
+    die "无法关闭 Acceptance 隔离钥匙串自动锁定"
+
+  default_keychain="$(HOME="$TEST_HOME" security default-keychain -d user 2>/dev/null)" || \
+    die "无法回读 Acceptance 隔离默认钥匙串"
+  default_keychain="$(printf '%s\n' "$default_keychain" | \
+    sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')"
+  [ "$default_keychain" = "$keychain" ] || \
+    die "Acceptance 默认钥匙串未指向隔离测试目录"
+  pass "Acceptance 默认钥匙串已隔离到测试 HOME"
+}
+
 listener_pids() {
   local lsof_bin output rc
   lsof_bin="$(command -v lsof 2>/dev/null || true)"
@@ -190,6 +237,7 @@ preflight() {
   [ -x "$SCIENCE_BIN" ] || die "未找到可执行 Science：$SCIENCE_BIN"
   [ -x "$PROJ/desktop/src-tauri/target/release/desktop" ] || \
     echo "WARN: release 测试二进制尚未构建"
+  prepare_isolated_keychain
   pass "测试 HOME 已隔离：$TEST_HOME"
   pass "测试端口空闲：$PROXY_PORT / $SANDBOX_PORT"
   pass "Codex OAuth callback 1455 / 1457 至少一个空闲（固定上游兼容端口，不动态改写）"

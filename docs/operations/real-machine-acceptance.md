@@ -6,7 +6,7 @@
 
 - 使用每次全新的独立 `HOME`、独立 `~/.csswitch`、独立 Science data-dir 和动态测试端口。
 - 准备环境时不读取、修改或删除真实 `~/.claude-science`、任何 Keychain / OAuth、SSH 私钥或真实 `~/.csswitch`。
-- macOS Keychain 不随 `HOME` 隔离，因此 Acceptance app 必须使用编译期独立 service `com.csswitch.acceptance.codex.oauth.v1` / `com.csswitch.acceptance.codex.thinking.v1`。只有用户在 Acceptance app 中明确点击 Codex 登录 / 退出后，才允许访问这两个 Acceptance service；不得读取、覆盖或删除正式 CSSwitch 或原生 Codex 的 Keychain / `~/.codex` 会话。
+- 当前 Security Framework 调用会按进程 `HOME` 查找默认钥匙串；空的隔离 `HOME` 若没有默认钥匙串，会在 OAuth 提交阶段触发 macOS 的“恢复默认钥匙串”提示并失败。guard 因此必须在临时 HOME 内创建、解锁并验证一个空的 `Library/Keychains/login.keychain-db`。此外 Acceptance app 仍必须使用编译期独立 service `com.csswitch.acceptance.codex.oauth.v1` / `com.csswitch.acceptance.codex.thinking.v1`，形成“钥匙串文件 + service namespace”双重隔离。只有用户在 Acceptance app 中明确点击 Codex 登录 / 退出后，才允许访问这两个 Acceptance service；不得读取、覆盖或删除正式 CSSwitch 或原生 Codex 的 Keychain / `~/.codex` 会话。
 - 真实 Science 的 `8765` 端口只用 `lsof` 观察基线 PID，不停止或接管。
 - 已安装 CSSwitch 正在运行时，不强退用户实例；构建独立 bundle ID 的 Acceptance app。
 - Gateway / Science 端口由 guard 动态分配并避开 `8765`、`1455`、`1457`；Codex 上游 OAuth callback 兼容端口仍固定尝试 `1455` / `1457`，guard 只检查至少一个空闲，不停止占位进程。
@@ -50,7 +50,7 @@ guard 会持久化本轮随机端口；后续命令无需手填固定端口。Co
 bash test/real_machine_guard.sh prepare-codex
 ```
 
-它只写入隔离 `HOME`，Codex 实验开关保持关闭，且不写 profile、token、credential ref 或 Keychain 内容。若 config 已存在会拒绝覆盖。
+`preflight` 在 macOS 上还会创建并验证隔离 HOME 自己的空默认钥匙串；不会读取或修改真实登录钥匙串。`prepare-codex` 只写入隔离 `HOME`，Codex 实验开关保持关闭，且不写 profile、token、credential ref 或 Keychain 内容。若 config 已存在会拒绝覆盖。
 
 只有验证 RM-01 v1 -> v2 迁移时才准备 legacy fixture。该步骤要求两个非空变量；使用明确的假值，不要读取或写入真实 provider key：
 

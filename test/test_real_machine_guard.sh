@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Offline contract checks for the real-machine guard.  These checks never launch
-# Science, OAuth, Keychain, or the CSSwitch runtime.
+# Science, OAuth, or the CSSwitch runtime. On macOS they create only an empty,
+# ephemeral Keychain inside the temporary Acceptance HOME.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,6 +32,19 @@ if guard preflight >/dev/null; then
   pass "preflight creates an isolated dynamic-port environment"
 else
   fail "preflight failed"
+fi
+
+if [ "$(uname -s)" = "Darwin" ]; then
+  ACCEPTANCE_KEYCHAIN="$(cd "$ACCEPTANCE_ROOT/home/Library/Keychains" 2>/dev/null && pwd -P)/login.keychain-db"
+  DEFAULT_KEYCHAIN="$(HOME="$ACCEPTANCE_ROOT/home" security default-keychain -d user 2>/dev/null || true)"
+  DEFAULT_KEYCHAIN="$(printf '%s\n' "$DEFAULT_KEYCHAIN" | \
+    sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')"
+  if [ -f "$ACCEPTANCE_KEYCHAIN" ] && [ ! -L "$ACCEPTANCE_KEYCHAIN" ] && \
+     [ "$DEFAULT_KEYCHAIN" = "$ACCEPTANCE_KEYCHAIN" ]; then
+    pass "preflight creates and selects an isolated Acceptance Keychain"
+  else
+    fail "preflight did not select the isolated Acceptance Keychain"
+  fi
 fi
 
 ENV_OUT="$(guard env 2>/dev/null || true)"

@@ -26,6 +26,7 @@ const AUTH_SCHEMA_VERSION: u32 = 2;
 const MAX_AUTH_LINE_BYTES: usize = 8 * 1024;
 const MAX_AUTH_OUTPUT_BYTES: u64 = 64 * 1024;
 const AUTH_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ACCEPTED_CANCEL_WATCHDOG: Duration = Duration::from_secs(2);
 #[cfg(not(feature = "acceptance-keychain"))]
 const EXPECTED_CODEX_KEYCHAIN_SERVICE: &str = "com.csswitch.codex.oauth.v1";
 #[cfg(feature = "acceptance-keychain")]
@@ -1102,7 +1103,7 @@ fn wait_for_login_sidecar(
         if exit_status.is_some() && output_eof {
             break;
         }
-        if accepted_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2)) {
+        if accepted_at.is_some_and(|at| at.elapsed() >= ACCEPTED_CANCEL_WATCHDOG) {
             stop_auth_child(&mut process.child);
             return Ok(json!({
                 "ok": false,
@@ -1895,8 +1896,13 @@ mod tests {
         .unwrap();
         assert_eq!(ack, "accepted");
         assert_eq!(value["state"], "cancelled");
-        assert!(started.elapsed() >= Duration::from_secs(2));
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= ACCEPTED_CANCEL_WATCHDOG);
+        // The fixture exits naturally after five seconds. A successful
+        // cancelled result before then proves the acknowledged-cancel watchdog
+        // reaped it; do not make this test depend on sub-second scheduler slack
+        // while the full Rust suite is running in parallel.
+        assert!(elapsed < Duration::from_secs(5));
     }
 
     #[test]
