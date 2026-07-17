@@ -14,13 +14,14 @@ import { CODEX_AUTH_REASONS, formatCodexAuthCommandError, parseCodexAuthCommandE
 // 预览兜底：在普通浏览器（没有 Tauri 后端）里打开时用 mockInvoke 返回假数据，
 // 让界面能完整渲染。真实 app 里 window.__TAURI__ 存在，走真后端，此兜底不生效。
 const PREVIEW = !window.__TAURI__;
-const previewParams = new URLSearchParams(window.location.search);
-const PREVIEW_CODEX = PREVIEW && previewParams.get("codex") === "1";
-const PREVIEW_CODEX_STALE = PREVIEW && previewParams.get("catalog") === "stale";
-const PREVIEW_CODEX_NETWORK = PREVIEW && previewParams.get("catalog") === "network";
-const PREVIEW_CONFIG_REFRESH_FAIL = PREVIEW && previewParams.get("config_refresh") === "fail";
-const PREVIEW_SLOW_ACTIVATION = PREVIEW && previewParams.get("activation") === "slow";
-const PREVIEW_RUNTIME_CACHE = PREVIEW && previewParams.get("runtime") === "cache";
+const QUERY = new URLSearchParams(window.location.search);
+const PROTOTYPE_ENABLED = QUERY.get("prototype") === "skills-mcp";
+const PREVIEW_CODEX = PREVIEW && QUERY.get("codex") === "1";
+const PREVIEW_CODEX_STALE = PREVIEW && QUERY.get("catalog") === "stale";
+const PREVIEW_CODEX_NETWORK = PREVIEW && QUERY.get("catalog") === "network";
+const PREVIEW_CONFIG_REFRESH_FAIL = PREVIEW && QUERY.get("config_refresh") === "fail";
+const PREVIEW_SLOW_ACTIVATION = PREVIEW && QUERY.get("activation") === "slow";
+const PREVIEW_RUNTIME_CACHE = PREVIEW && QUERY.get("runtime") === "cache";
 const invoke = PREVIEW
   ? (cmd, args) => mockInvoke(cmd, args)
   : window.__TAURI__.core.invoke;
@@ -48,7 +49,7 @@ const MOCK_TEMPLATES = [
 ];
 const mockStore = {
   schema_version: 3,
-  active_id: PREVIEW_CODEX ? "p-codex" : "",
+  active_id: PREVIEW_CODEX ? "p-codex" : "p-demo1",
   proxy_port: 18991,
   sandbox_port: 8990,
   reuse_system_ssh: false,
@@ -58,8 +59,10 @@ const mockStore = {
   fail_next_get_config: false,
   mode: "proxy",
   profiles: [
-    { id: "p-demo1", name: "我的 GLM", template_id: "glm", category: "cn_official", api_format: "anthropic", base_url: "https://open.bigmodel.cn/api/anthropic", model: "glm-4.6", key: "••••••1234", icon: "glm", icon_color: "#2E6BE6", website_url: "https://open.bigmodel.cn", sort_index: 1, notes: "" },
-    ...(PREVIEW_CODEX ? [{ id: "p-codex", name: "我的 Codex", template_id: "codex", category: "experimental", api_format: "openai_responses", base_url: "", model: "", key: "", has_key: false, has_credential: true, credential_source: "csswitch_oauth", model_policy: "dynamic_catalog", capabilities: MOCK_CODEX_CAPABILITIES, icon: "custom", icon_color: "#111827", website_url: "https://developers.openai.com/codex/", sort_index: 2, notes: "" }] : []),
+    { id: "p-demo1", name: "我的 GLM", template_id: "glm", category: "cn_official", api_format: "anthropic", base_url: "https://open.bigmodel.cn/api/anthropic", model: "glm-4.6", model_options: ["glm-5.2", "glm-4.7", "glm-4.6"], key: "••••••1234", icon: "glm", icon_color: "#2E6BE6", website_url: "https://open.bigmodel.cn", sort_index: 1, notes: "" },
+    { id: "p-demo2", name: "DeepSeek 工作", template_id: "deepseek", category: "cn_official", api_format: "anthropic", base_url: "https://api.deepseek.com/anthropic", model: "deepseek-chat", model_options: ["deepseek-chat", "deepseek-reasoner"], key: "••••••8452", icon: "deepseek", icon_color: "#1E88E5", website_url: "https://platform.deepseek.com", sort_index: 2, notes: "" },
+    { id: "p-demo3", name: "Kimi Coding", template_id: "kimi", category: "cn_official", api_format: "anthropic", base_url: "https://api.moonshot.cn/anthropic", model: "kimi-k2.7-code", model_options: ["kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"], key: "••••••7731", icon: "kimi", icon_color: "#16182F", website_url: "https://platform.moonshot.cn", sort_index: 3, notes: "" },
+    ...(PREVIEW_CODEX ? [{ id: "p-codex", name: "我的 Codex", template_id: "codex", category: "experimental", api_format: "openai_responses", base_url: "", model: "", key: "", has_key: false, has_credential: true, credential_source: "csswitch_oauth", model_policy: "dynamic_catalog", capabilities: MOCK_CODEX_CAPABILITIES, icon: "custom", icon_color: "#111827", website_url: "https://developers.openai.com/codex/", sort_index: 4, notes: "" }] : []),
   ],
 };
 let mockCodexAuth = {
@@ -113,7 +116,7 @@ function mockInvoke(cmd, args) {
         id, name: args.name || t.name || "新配置", template_id: args.templateId,
         category: t.category || "custom", api_format: t.api_format || "anthropic",
         base_url: args.baseUrl || t.base_url || "", model: args.model || "",
-        key: mockMask(args.key || ""), icon: t.icon, icon_color: t.icon_color,
+        key: mockMask(args.key || ""), model_options: [...(t.builtin_models || [])], icon: t.icon, icon_color: t.icon_color,
         website_url: t.website_url, sort_index: mockStore.profiles.length + 1, notes: "",
       });
       return Promise.resolve(id);
@@ -266,6 +269,136 @@ let pendingSkipActivateId = null;   // set_active 校验含糊时，允许「跳
 let pendingConfirm = null;          // 危险操作（清 key / 删除）的「再点一次确认」态
 
 const CAT_LABELS = { official: "官方", cn_official: "国内", custom: "自定义", experimental: "实验" };
+const MODEL_FAMILY_ICONS = {
+  anthropic: { file: "anthropic.svg", label: "Anthropic" },
+  deepseek: { file: "deepseek.svg", label: "DeepSeek" },
+  generic: { file: "generic.svg", label: "自定义模型" },
+  glm: { file: "glm.svg", label: "智谱 GLM" },
+  kimi: { file: "kimi.svg", label: "Kimi" },
+  minimax: { file: "minimax.svg", label: "MiniMax" },
+  openai: { file: "openai.svg", label: "OpenAI" },
+  openrouter: { file: "openrouter.svg", label: "OpenRouter" },
+  qwen: { file: "qwen.svg", label: "通义千问" },
+  siliconflow: { file: "siliconflow.svg", label: "硅基流动" },
+  xiaomi: { file: "xiaomi.svg", label: "小米 MiMo" },
+};
+
+function modelFamilyKey(profile = {}) {
+  const templateId = String(profile.template_id || "").toLowerCase();
+  const icon = String(profile.icon || "").toLowerCase();
+  const direct = templateId || icon;
+  if (direct === "codex") return "openai";
+  if (direct === "custom-openai" || direct === "custom-openai-responses") return "openai";
+  if (direct === "custom") {
+    if (String(profile.api_format || "").startsWith("openai")) return "openai";
+    if (String(profile.api_format || "") === "anthropic") return "anthropic";
+  }
+  if (MODEL_FAMILY_ICONS[direct]) return direct;
+  if (MODEL_FAMILY_ICONS[icon]) return icon;
+
+  const value = [profile.model, profile.name, profile.base_url, profile.website_url]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  if (/openrouter/.test(value)) return "openrouter";
+  if (/siliconflow|siliconcloud/.test(value)) return "siliconflow";
+  if (/deepseek/.test(value)) return "deepseek";
+  if (/glm|zhipu|bigmodel|zai-org/.test(value)) return "glm";
+  if (/kimi|moonshot/.test(value)) return "kimi";
+  if (/minimax/.test(value)) return "minimax";
+  if (/qwen|dashscope|tongyi/.test(value)) return "qwen";
+  if (/mimo|xiaomi/.test(value)) return "xiaomi";
+  if (/claude|anthropic/.test(value)) return "anthropic";
+  if (/gpt|openai/.test(value)) return "openai";
+  return "generic";
+}
+
+function modelFamilyMeta(profile = {}) {
+  const key = modelFamilyKey(profile);
+  const item = MODEL_FAMILY_ICONS[key] || MODEL_FAMILY_ICONS.generic;
+  return { ...item, key, src: `/assets/model-icons/${item.file}` };
+}
+
+function updateModelIcon(image, profile) {
+  if (!image) return;
+  const meta = modelFamilyMeta(profile);
+  image.src = meta.src;
+  image.title = meta.label;
+  image.dataset.modelFamily = meta.key;
+}
+
+function modelIconMarkup(profile) {
+  const meta = modelFamilyMeta(profile);
+  return `<img class="model-family-icon profile-model-icon" src="${meta.src}" alt="" aria-hidden="true" title="${escapeHtml(meta.label)}" data-model-family="${meta.key}" />`;
+}
+const PAGE_META = {
+  switch: ["", "模型连接", ""],
+  skills: ["", "Skill & MCP", ""],
+  status: ["", "状态", ""],
+  settings: ["", "设置", ""],
+};
+
+function applyTheme(theme) {
+  const value = theme === "dark" ? "dark" : "light";
+  document.documentElement.dataset.theme = value;
+  if (els.themeBtn) els.themeBtn.textContent = value === "dark" ? "切换浅色主题" : "切换深色主题";
+  try { localStorage.setItem("csswitch-theme", value); } catch (_) {}
+}
+
+function setPage(page) {
+  if (page === "profiles") page = "switch";
+  if (page === "skills" && !PROTOTYPE_ENABLED) page = "switch";
+  const meta = PAGE_META[page] || PAGE_META.switch;
+  document.querySelectorAll("[data-page]").forEach((node) => node.classList.toggle("active", node.dataset.page === page));
+  document.querySelectorAll("[data-page-target]").forEach((node) => node.classList.toggle("active", node.dataset.pageTarget === page));
+  if (els.pageEyebrow) els.pageEyebrow.textContent = meta[0];
+  if (els.pageTitle) els.pageTitle.textContent = meta[1];
+  if (els.pageSubtitle) els.pageSubtitle.textContent = meta[2];
+}
+
+async function configureDesktopWindow() {
+  if (PREVIEW) return;
+  try {
+    const appWindow = window.__TAURI__.window.getCurrentWindow();
+    const LogicalSize = window.__TAURI__.dpi.LogicalSize;
+    await appWindow.setMinSize(new LogicalSize(760, 520));
+    await appWindow.setSize(new LogicalSize(920, 600));
+  } catch (_) {
+    // 某些受限 WebView 权限下不能改窗口尺寸；界面本身仍保持响应式。
+  }
+}
+
+function renderCurrentSummary() {
+  if (!els.currentProfileName) return;
+  if (mode === "official") {
+    updateModelIcon(els.currentProfileIcon, { template_id: "anthropic" });
+    els.currentProfileName.textContent = "官方 Claude";
+    els.currentProfileState.textContent = "官方订阅";
+    els.currentProfileState.className = "state-pill success";
+    els.currentRouteMode.textContent = "官方直连";
+    els.currentProfileModel.textContent = "Claude Science";
+    els.currentProfileMeta.textContent = "订阅与登录由 Claude Science 管理";
+    return;
+  }
+  const profile = (configState.profiles || []).find((item) => item.id === configState.active_id);
+  els.currentRouteMode.textContent = "CSSwitch 代理";
+  if (!profile) {
+    updateModelIcon(els.currentProfileIcon, {});
+    els.currentProfileName.textContent = "尚未选择配置";
+    els.currentProfileState.textContent = "等待选择";
+    els.currentProfileState.className = "state-pill neutral";
+    els.currentProfileModel.textContent = "未配置";
+    els.currentProfileMeta.textContent = "从下方选择配置方案";
+    return;
+  }
+  const hasKey = typeof profile.has_key === "boolean" ? profile.has_key : !!profile.key;
+  updateModelIcon(els.currentProfileIcon, profile);
+  els.currentProfileName.textContent = profile.name || "未命名配置";
+  els.currentProfileState.textContent = "当前生效";
+  els.currentProfileState.className = "state-pill success";
+  els.currentProfileModel.textContent = profile.model || modelSummary(profile);
+  els.currentProfileMeta.textContent = profile.base_url || (hasKey ? "Key 已保存" : "未填写端点");
+}
 
 // ── 模型能力（纯函数，无 DOM）：native 映射 / relay 跟随 / relay 固定 / 账号动态目录。──
 const CAP = { NATIVE: "native", FOLLOW: "follow", FIXED: "fixed", DYNAMIC: "dynamic" };
@@ -403,6 +536,18 @@ function setMsg(text, kind) {
 function setLight(el, s) {
   const cls = { green: "g", amber: "a", red: "r" }[s] || "a";
   el.className = "lt " + cls;
+  document.querySelectorAll('[data-mirror-light="' + el.id + '"]').forEach((node) => {
+    node.className = "lt " + cls;
+  });
+}
+
+function setStatusText(id, status) {
+  const labels = { green: "运行正常", amber: "等待 / 未运行", red: "需要处理" };
+  const node = $(id);
+  if (node) node.textContent = labels[status] || labels.amber;
+  document.querySelectorAll('[data-mirror-text="' + id + '"]').forEach((mirror) => {
+    mirror.textContent = labels[status] || labels.amber;
+  });
 }
 
 function proxyRecoveryMessage(status) {
@@ -602,15 +747,16 @@ function tplById(id) {
 
 // ── 视图切换：列表 / 新建向导 / 连接编辑 / 改名。一次只显示一个表单（列表隐去减少高度）。──
 function showView(v) {
+  els.connectionOverview.hidden = v !== "list";
   els.listSec.hidden = v !== "list";
-  els.advSec.hidden = v !== "list";
   els.wizSec.hidden = v !== "wizard";
   els.connSec.hidden = v !== "conn";
   els.metaSec.hidden = v !== "meta";
   els.panel.classList.toggle("view-form", v !== "list");
+  if (v !== "list") setPage("switch");
   if (v === "list") hideSkip();
 }
-function cancelForm() { showView("list"); setMsg("就绪。"); }
+function cancelForm() { showView("list"); setPage("switch"); setMsg("就绪。"); }
 
 function showSkip() { els.skipActivateBtn.hidden = false; }
 function hideSkip() { els.skipActivateBtn.hidden = true; pendingSkipActivateId = null; }
@@ -1226,41 +1372,62 @@ function modelSummary(p) {
   return "未选模型";
 }
 
+function profileModelOptions(p) {
+  const template = tplById(p.template_id);
+  const available = (p.model_options || []).length
+    ? p.model_options
+    : ((template && template.builtin_models) || []);
+  const candidates = [p.model, ...available]
+    .filter(Boolean);
+  return [...new Set(candidates)];
+}
+
+function profileModelControl(p) {
+  const model = p.model || "";
+  if (!(PREVIEW && PROTOTYPE_ENABLED)) {
+    return `<strong class="profile-model-text">${modelSummary(p)}</strong>`;
+  }
+  const options = profileModelOptions(p);
+  return `<select class="profile-model-select" data-profile-model="${escapeHtml(p.id)}" aria-label="${escapeHtml(p.name)} 的模型">
+    ${options.map((value) => `<option value="${escapeHtml(value)}"${value === model ? " selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+  </select>`;
+}
+
 function renderList() {
   const list = els.profileList;
   const ps = configState.profiles || [];
+  renderCurrentSummary();
   if (!ps.length) {
-    list.innerHTML = '<div class="empty">还没有配置。点右上「＋ 新建」加一条第三方来源。</div>';
+    list.innerHTML = '<div class="empty">还没有配置。使用“新建配置”添加一条第三方来源。</div>';
     return;
   }
-  list.innerHTML = ps.map((p) => {
+  const header = `<div class="profile-list-head" aria-hidden="true"><span>配置</span><span>模型</span><span>凭据</span><span>操作</span></div>`;
+  list.innerHTML = header + ps.map((p) => {
     const active = p.id === configState.active_id;
     const codex = isCodexSource(p);
     const codexEnabled = !!configState.experimental_codex_enabled;
-    const catLabel = CAT_LABELS[p.category] || p.category || "";
     const hasKey = typeof p.has_key === "boolean" ? p.has_key : !!p.key;
-    const keyMask = hasKey ? escapeHtml(p.key_masked || p.key || "已保存") : "未填 key";
-    const modelTxt = modelSummary(p);
-    const dotStyle = p.icon_color ? ' style="background:' + escapeHtml(p.icon_color) + '"' : "";
-    const endpointTxt = codex ? "CSSwitch 托管 Codex 网关" : escapeHtml(p.base_url || "（未填地址）");
-    const credentialTxt = codex ? "CSSwitch OAuth" : keyMask;
+    const credential = codex ? "CSSwitch OAuth" : (hasKey ? escapeHtml(p.key_masked || p.key || "已保存") : "未填写");
     return (
       '<div class="prow' + (active ? " pactive" : "") + '" data-id="' + escapeHtml(p.id) + '">' +
-        '<div class="prow-top">' +
-          '<span class="pico"' + dotStyle + "></span>" +
-          '<span class="pname">' + escapeHtml(p.name) + "</span>" +
-          '<span class="badge">' + escapeHtml(catLabel) + "</span>" +
-          (active ? '<span class="badge on">当前生效</span>' : "") +
-          (codex && !codexEnabled ? '<span class="badge warn">入口已关闭</span>' : "") +
+        '<div class="profile-identity">' +
+          '<div class="prow-top">' +
+            modelIconMarkup(p) +
+            '<span class="pname">' + escapeHtml(p.name) + "</span>" +
+            (active ? '<span class="badge on">当前</span>' : "") +
+            (codex && !codexEnabled ? '<span class="badge warn">入口已关闭</span>' : "") +
+          "</div>" +
         "</div>" +
-        '<div class="pmeta">' + endpointTxt + "</div>" +
-        '<div class="pmeta">模型：' + modelTxt + " · 凭据：" + credentialTxt + "</div>" +
+        '<div class="profile-model-cell">' + profileModelControl(p) + "</div>" +
+        '<div class="profile-key-cell"><strong>' + credential + "</strong></div>" +
         '<div class="prow-acts">' +
           (active || (codex && !codexEnabled) ? "" : '<button class="abtn prim" data-act="activate">设为当前</button>') +
-          (codex && !codexEnabled ? "" : '<button class="abtn" data-act="editconn">' + (codex ? "查看模型" : "编辑连接") + "</button>") +
-          '<button class="abtn" data-act="editmeta">改名</button>' +
-          (codex ? "" : '<button class="abtn" data-act="clearkey">清 key</button>') +
-          '<button class="abtn danger" data-act="delete">删除</button>' +
+          (codex && !codexEnabled ? "" : '<button class="abtn" data-act="editconn">' + (codex ? "查看模型" : "编辑") + "</button>") +
+          '<details class="profile-more"><summary>更多</summary><div class="profile-menu">' +
+            '<button class="abtn" data-act="editmeta">名称与备注</button>' +
+            (codex ? "" : '<button class="abtn" data-act="clearkey">清除 Key</button>') +
+            '<button class="abtn danger" data-act="delete">删除配置</button>' +
+          "</div></details>" +
         "</div>" +
       "</div>"
     );
@@ -1276,7 +1443,8 @@ function applyMode(m) {
     b.classList.toggle("active", b.dataset.mode === mode)
   );
   els.oneClickBtn.textContent =
-    mode === "official" ? "打开官方 Claude Science ↗" : "⚡ 一键开始";
+    mode === "official" ? "打开官方 Claude Science" : "一键开始";
+  renderCurrentSummary();
 }
 
 async function switchMode(m) {
@@ -1907,7 +2075,8 @@ async function runOneClick(runtimeChoice) {
     const r = await call("one_click_login", { runtimeChoice: runtimeChoice || null });
     // 透传后端据实回传的 msg（已重开 / 已用新配置重启 / 沿用原对话 / 已启动 / 打开失败请手动打开）。
     const active = (configState.profiles || []).find((p) => p.id === configState.active_id);
-    setMsg((r.msg || "已就绪，正在打开面板…") + (isCodexSource(active)
+    const message = (r.msg || "已就绪，正在打开面板…").replace("打开 Science", "浏览器打开");
+    setMsg(message + (isCodexSource(active)
       ? " 请在 Science 的 More models 中选择 Codex / … 后再发第一条消息；默认 Claude 壳会被明确拒绝。"
       : ""), "ok");
     await refreshStatus();
@@ -2066,10 +2235,14 @@ async function refreshStatus() {
     setLight(els.ltProxy, s.proxy);
     setLight(els.ltSandbox, s.sandbox);
     setLight(els.ltUpstream, s.upstream);
+    setStatusText("proxyStateText", s.proxy);
+    setStatusText("sandboxStateText", s.sandbox);
+    setStatusText("upstreamStateText", s.upstream);
     els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
     setStatusRecoveryMsg(proxyRecoveryMessage(s));
   } catch (e) {
     [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "amber"));
+    ["proxyStateText", "sandboxStateText", "upstreamStateText"].forEach((id) => setStatusText(id, "amber"));
   }
 }
 
@@ -2081,14 +2254,28 @@ function wire() {
     "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "reuseSystemSsh", "advSec",
     "codexEnabled", "codexAuthStatus", "codexStatusBtn", "codexLoginBtn", "codexCancelBtn", "codexLogoutBtn", "codexProfileRepairBox", "codexRepairProfileBtn",
     "codexNetworkMode", "codexProxyUrl", "codexNetworkResolved", "codexNetworkSaveBtn", "codexDowngradeBox", "codexDowngradeBtn",
-    "listSec", "profileList", "newBtn", "skipActivateBtn",
+    "connectionOverview", "listSec", "profileList", "newBtn", "skipActivateBtn",
     "wizSec", "wizTemplate", "wizTemplateChips", "wizTplLabel", "wizTplHint", "wizName", "wizBaseGroup", "wizBase", "wizBaseHint",
     "wizModelGroup", "wizModelLabel", "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelHint", "wizCodexCatalog", "wizCodexCatalogMeta", "wizCodexCatalogList", "wizKeyGroup", "wizKey", "wizSaveBtn", "wizCancelBtn",
     "connSec", "connTitle", "connBaseGroup", "connBase", "connBaseHint", "connFetchBtn",
     "connModelGroup", "connModelLabel", "connModelInfo", "connModel", "connModelHint", "connCodexCatalog", "connCodexCatalogMeta", "connCodexCatalogList", "connKeyGroup", "connKey", "connSaveBtn", "connClearBtn", "connCancelBtn",
     "metaSec", "metaName", "metaNotes", "metaSaveBtn", "metaCancelBtn",
+    "themeBtn", "pageEyebrow", "pageTitle", "pageSubtitle", "prototypeFlag",
+    "currentProfileIcon", "currentProfileName", "currentProfileState", "currentRouteMode", "currentProfileModel", "currentProfileMeta",
+    "proxyStateText", "sandboxStateText", "upstreamStateText",
   ].forEach((id) => (els[id] = $(id)));
   els.panel = document.querySelector(".panel");
+
+  document.querySelectorAll("[data-page-target]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.dataset.pageTarget === "switch") showView("list");
+      setPage(button.dataset.pageTarget);
+    });
+  });
+  let savedTheme = "light";
+  try { savedTheme = localStorage.getItem("csswitch-theme") || "light"; } catch (_) {}
+  applyTheme(savedTheme);
+  els.themeBtn.addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
 
   els.modeSeg.querySelectorAll(".seg-btn").forEach((b) =>
     b.addEventListener("click", () => switchMode(b.dataset.mode))
@@ -2120,6 +2307,21 @@ function wire() {
     else if (act === "editmeta") openMeta(id);
     else if (act === "clearkey") clearKey(id);
     else if (act === "delete") del(id);
+  });
+
+  // 模型下拉只在显式 UI 原型中启用；不新增 Tauri command，也不改真实配置。
+  els.profileList.addEventListener("change", (e) => {
+    const select = e.target.closest("[data-profile-model]");
+    if (!select || !(PREVIEW && PROTOTYPE_ENABLED)) return;
+    const id = select.getAttribute("data-profile-model");
+    const model = select.value;
+    const profile = (configState.profiles || []).find((item) => item.id === id);
+    const stored = (mockStore.profiles || []).find((item) => item.id === id);
+    if (!profile || !stored) return;
+    profile.model = model;
+    stored.model = model;
+    renderList();
+    setMsg(`原型：已将「${profile.name}」的模型设为 ${model}。`, "ok");
   });
 
   els.newBtn.addEventListener("click", openWizard);
@@ -2175,6 +2377,20 @@ function wire() {
 window.addEventListener("DOMContentLoaded", async () => {
   wire();
   try { await registerCodexAuthEvents(); } catch (e) { setMsg("无法订阅 Codex 登录状态：" + e, "err"); }
+  await configureDesktopWindow();
+  if (PROTOTYPE_ENABLED) {
+    document.querySelectorAll(".prototype-nav").forEach((node) => { node.hidden = false; });
+    els.prototypeFlag.hidden = false;
+    setPage("skills");
+    try {
+      const { mountSkillMcpPrototype } = await import("./skill-mcp-prototype.js");
+      mountSkillMcpPrototype($("skillMcpPrototypeRoot"), QUERY.get("fixture") || "healthy");
+    } catch (e) {
+      $("skillMcpPrototypeRoot").innerHTML = '<div class="prototype-loading">原型载入失败：' + escapeHtml(e) + "</div>";
+    }
+  } else {
+    setPage("switch");
+  }
   await loadConfig();
   if (!PREVIEW && window.__TAURI__.event) {
     window.__TAURI__.event.listen("boot://failed", (e) => {
@@ -2188,9 +2404,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {}
   try { els.verLabel.textContent = "v" + (await call("app_version")); } catch (e) {}
   await refreshStatus();
-  if (PREVIEW) {
-    setMsg("预览模式：仅看界面，按钮不连后端（真实 app 里会连进程管家）。");
+  if (PREVIEW && !PROTOTYPE_ENABLED) {
+    els.prototypeFlag.textContent = "浏览器预览 · 不连后端";
+    els.prototypeFlag.hidden = false;
   } else {
-    statusTimer = setInterval(refreshStatus, 2500);
+    if (!PREVIEW) statusTimer = setInterval(refreshStatus, 2500);
   }
 });
