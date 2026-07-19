@@ -74,10 +74,24 @@ pub(crate) fn recover_interrupted_gateway<R: Runtime>(
     state: &SharedAppState,
 ) -> Result<(), String> {
     let dir = config::default_dir();
-    let cfg = config::load_from(&dir).map_err(|error| error.to_string())?;
+    recover_interrupted_gateway_from_dir(app, state, &dir)
+}
+
+fn recover_interrupted_gateway_from_dir<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &SharedAppState,
+    dir: &Path,
+) -> Result<(), String> {
+    let cfg = config::load_from(dir).map_err(|error| error.to_string())?;
     let Some(journal) = cfg.runtime_transaction.as_ref() else {
         return Ok(());
     };
+    if journal.target_profile_id != cfg.active_id {
+        return Err(
+            "未完成运行事务的 target profile 与当前 active profile 不一致；已保留 listener 和事务 journal，拒绝自动恢复，等待人工或后续恢复。"
+                .into(),
+        );
+    }
     {
         let st = lock(state);
         if st.proxy.is_some()
@@ -130,7 +144,7 @@ pub(crate) fn recover_interrupted_gateway<R: Runtime>(
         );
     }
     let binary = gateway_bin_path(app).ok_or("未找到本次应用打包的 Gateway，无法安全恢复事务")?;
-    config::update(&dir, |current| {
+    config::update(dir, |current| {
         if let Some(current_journal) = current.runtime_transaction.as_mut() {
             if current_journal.transaction_id == journal.transaction_id {
                 current_journal.stage = "recover_interrupted_gateway".into();
@@ -848,14 +862,19 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 mod tests {
     use super::{
         configure_managed_proxy_command, find_gateway_in, formal_proxy_env, gateway_bin_path_from,
-        interrupted_health_matches, skill_install_bridge_token,
+        interrupted_health_matches, recover_interrupted_gateway_from_dir,
+        skill_install_bridge_token,
     };
     use crate::provider_contracts::{
         CachePolicy, EndpointPolicy, ModelPolicy, TimeoutPolicy, Transport,
     };
     use crate::runtime::provider::{FormalCredential, FormalGatewayPlan};
     use std::fs;
+    use std::io::ErrorKind;
+    use std::net::{TcpListener, TcpStream};
     use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn health(provider: &str, launch_id: &str, catalog_fp: &str) -> crate::proc::GatewayHealth {
@@ -909,6 +928,90 @@ mod tests {
             Some("target-catalog"),
             Some(&previous_identity),
         ));
+    }
+
+    #[test]
+    fn mismatched_recovery_target_preserves_listener_and_journal() {
+        let dir = std::env::temp_dir().join(format!(
+            "csswitch-recovery-target-mismatch-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (model_catalog, default_model_route_id, role_bindings) =
+            crate::model_catalog::new_profile_catalog(
+                "deepseek",
+                "anthropic",
+                Some("deepseek-v4-flash"),
+            )
+            .unwrap();
+        let journal = crate::config::RuntimeTransactionJournal {
+            transaction_id: "tx-stale-target".into(),
+            target_profile_id: "stale-profile".into(),
+            stage: "start_formal_gateway".into(),
+            previous_binding: None,
+            previous_gateway: None,
+        };
+        let cfg = crate::config::Config {
+            profiles: vec![crate::config::Profile {
+                id: "active-profile".into(),
+                template_id: "deepseek".into(),
+                api_format: "anthropic".into(),
+                model: "deepseek-v4-flash".into(),
+                model_catalog,
+                default_model_route_id,
+                role_bindings,
+                model_policy: crate::provider_contracts::ModelPolicy::SavedCatalog,
+                ..Default::default()
+            }],
+            active_id: "active-profile".into(),
+            proxy_port: address.port(),
+            sandbox_port: if address.port() == 8990 { 8991 } else { 8990 },
+            runtime_transaction: Some(journal.clone()),
+            ..Default::default()
+        };
+        crate::config::save_to(&dir, &cfg).unwrap();
+        let before = fs::read(dir.join("config.json")).unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = Arc::new(Mutex::new(crate::AppState::default()));
+
+        let error = recover_interrupted_gateway_from_dir(app.handle(), &state, &dir).unwrap_err();
+        assert!(error.contains("target profile 与当前 active profile 不一致"));
+        assert!(error.contains("已保留 listener 和事务 journal"));
+        assert_eq!(fs::read(dir.join("config.json")).unwrap(), before);
+        assert_eq!(
+            crate::config::load_from(&dir).unwrap().runtime_transaction,
+            Some(journal)
+        );
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+        let _client = TcpStream::connect(address).unwrap();
+        let mut accepted = false;
+        for _ in 0..50 {
+            match listener.accept() {
+                Ok(_) => {
+                    accepted = true;
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("listener accept failed: {error}"),
+            }
+        }
+        assert!(
+            accepted,
+            "mismatched recovery must leave the listener usable"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn launch(adapter: &str, model: &str) -> FormalGatewayPlan {

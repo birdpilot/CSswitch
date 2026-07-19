@@ -387,7 +387,8 @@ pub fn run() {
         .setup(|app| {
             install_menu(app)?;
 
-            // 启动即触发一次 load：若是旧 v1 固定槽文件，这里完成 v1→v2 迁移 + 落盘 + 留 .v1.bak；
+            // 启动即触发一次 load：旧 v1/v2/v3 配置在这里经迁移链升级并只提交一次当前 v4；
+            // v1/v2/v3 的版本备份由 config::load_from 按不可覆盖合同保存；
             // 悬空 active 归一化为空。迁移逻辑并入 config::load_from（不再单独跑 relay_presets）。
             let _ = config::load_from(&config::default_dir());
 

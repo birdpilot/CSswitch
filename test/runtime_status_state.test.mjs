@@ -36,3 +36,21 @@ test("运行反馈统一显示在右上角且不会触发页面滚动", () => {
   const setMsg = js.slice(js.indexOf("function setMsg("), js.indexOf("function setBrowserFallback("));
   assert.doesNotMatch(setMsg, /scrollIntoView/);
 });
+
+test("运行时窗口重设与 Tauri 默认尺寸保持一致", () => {
+  const js = readFileSync(new URL("../desktop/src/main.js", import.meta.url), "utf8");
+  const tauri = JSON.parse(readFileSync(new URL("../desktop/src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  const testTauri = JSON.parse(readFileSync(new URL("./tauri.real-machine.conf.json", import.meta.url), "utf8"));
+  const mainWindow = tauri.app.windows.find((item) => item.label === "main");
+  const testWindow = testTauri.app.windows.find((item) => item.label === "main");
+  assert.deepEqual([mainWindow.width, mainWindow.height], [920, 650.5]);
+  assert.deepEqual([testWindow.width, testWindow.height], [920, 650.5]);
+
+  const configureWindow = js.slice(
+    js.indexOf("async function configureDesktopWindow()"),
+    js.indexOf("function renderCurrentSummary()"),
+  );
+  assert.match(configureWindow, /setMinSize\(new LogicalSize\(760, 520\)\)/);
+  assert.match(configureWindow, /setSize\(new LogicalSize\(920, 650\.5\)\)/);
+  assert.doesNotMatch(configureWindow, /setSize\(new LogicalSize\(920, 600\)\)/);
+});

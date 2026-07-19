@@ -46,7 +46,7 @@ fn config_access() -> std::sync::MutexGuard<'static, ConfigAccessState> {
 fn ensure_config_access_open(access: &ConfigAccessState) -> io::Result<()> {
     if access.downgrade_terminal {
         Err(io::Error::other(
-            "配置已降为 v2，CSSwitch 正在终态退出；拒绝再次读取或写入，避免自动迁回 v3。",
+            "配置已降为 v2，CSSwitch 正在终态退出；拒绝再次读取或写入，避免自动迁回当前 schema v4。",
         ))
     } else {
         Ok(())
@@ -1703,7 +1703,7 @@ pub(crate) fn prepare_downgrade_to_v2(
     })
 }
 
-/// 把当前 v3 原子降为 v2。调用方必须先停止受管 Codex 链路；本函数从不读取、
+/// 把当前 v4 原子降为 v2。调用方必须先停止受管 Codex 链路；本函数从不读取、
 /// 删除或修改 CSSwitch 私有认证文件。若 action 要求 export，先把 bundle 原子持久化到调用方明确
 /// 给出的目标，再提交 v2。两次提交之间崩溃只会留下“原配置 + 已完成 export”，不会
 /// 出现 profile 已移除但 export 尚未落盘的数据丢失窗口。
@@ -1721,7 +1721,8 @@ pub(crate) fn downgrade_to_v2(
 /// Production terminal variant. It serializes against every config read/write,
 /// commits v2, then latches the process closed before releasing the lock. Any
 /// in-flight or later status/config command therefore finishes before commit or
-/// fails without observing v2; none can trigger the normal v2 -> v3 migration.
+/// fails without observing v2; none can trigger the normal migration chain from v2 back to the
+/// current schema v4.
 pub(crate) fn downgrade_to_v2_and_latch(
     dir: &Path,
     actions: &BTreeMap<String, CodexDowngradeAction>,
